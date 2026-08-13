@@ -20,6 +20,7 @@ const disconnectsPending = new Set();
 // In-memory ring buffer of chat messages. Not persisted — resets on redeploy.
 const chatMessages = [];   // { id, userId, displayName, name, text, ts }
 const MAX_CHAT_MESSAGES = 200;
+const CHAT_TTL_MS = 60 * 1000;  // messages older than 60s are dropped
 let chatIdCounter = 0;
 
 const TIMEOUT = 15000; // 15 seconds before a client is considered gone
@@ -38,6 +39,13 @@ function pushChat(userId, displayName, name, text) {
         chatMessages.splice(0, chatMessages.length - MAX_CHAT_MESSAGES);
     }
     return msg;
+}
+
+function pruneChat() {
+    const cutoff = Date.now() - CHAT_TTL_MS;
+    while (chatMessages.length && chatMessages[0].ts < cutoff) {
+        chatMessages.shift();
+    }
 }
 
 function readBody(req) {
@@ -154,6 +162,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (req.url === "/chat/messages" || req.url.startsWith("/chat/messages?"))) {
         const url = new URL(req.url, "http://localhost");
         const since = Number(url.searchParams.get("since")) || 0;
+        pruneChat();
         const out = since > 0
             ? chatMessages.filter((m) => m.id > since)
             : chatMessages.slice(-MAX_CHAT_MESSAGES);
@@ -198,6 +207,7 @@ setInterval(() => {
             delete activeUsers[idStr];
         }
     }
+    pruneChat();
 }, 10000);
 
 const PORT = process.env.PORT || 3000;
