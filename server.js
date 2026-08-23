@@ -25,6 +25,15 @@ let chatIdCounter = 0;
 
 const TIMEOUT = 15000; // 15 seconds before a client is considered gone
 
+// placeId -> game name shown on the website's Live tab
+const PLACE_NAMES = {
+    83038462357724: "Graben und reinigen",
+    94640181989498: "Grow a Chicken Fighter",
+    107778070777162: "Steal an Egg",
+    100068273119174: "Leaf Simulator",
+    128736949265057: "Gakuran",
+};
+
 function pushChat(userId, displayName, name, text) {
     const msg = {
         id: ++chatIdCounter,
@@ -108,6 +117,9 @@ const server = http.createServer(async (req, res) => {
             placeId: Number.isFinite(Number(data.placeId)) && Number(data.placeId) > 0
                 ? Number(data.placeId)
                 : (prev.placeId || 0),
+            executor: typeof data.executor === "string" && data.executor.length
+                ? data.executor.slice(0, 64)
+                : (prev.executor || ""),
         };
 
         let kick = false;
@@ -134,6 +146,29 @@ const server = http.createServer(async (req, res) => {
             });
         }
         return sendJson(res, 200, alive);
+    }
+
+    // GET /online — aggregates for the website's Live tab:
+    // { total, games: [{name, online, place_id}], executors: [{executor, online}] }
+    if (req.method === "GET" && req.url === "/online") {
+        const now = Date.now();
+        const byGame = new Map();
+        const byExecutor = new Map();
+        let total = 0;
+        for (const [idStr, info] of Object.entries(activeUsers)) {
+            if (now - info.lastSeen >= TIMEOUT) continue;
+            total++;
+            const placeId = info.placeId || 0;
+            const name = PLACE_NAMES[placeId] || "Unsupported";
+            if (!byGame.has(placeId)) byGame.set(placeId, { name, place_id: placeId, online: 0 });
+            byGame.get(placeId).online++;
+            const exec = info.executor || "Unknown";
+            if (!byExecutor.has(exec)) byExecutor.set(exec, { executor: exec, online: 0 });
+            byExecutor.get(exec).online++;
+        }
+        const games = [...byGame.values()].sort((a, b) => b.online - a.online);
+        const executors = [...byExecutor.values()].sort((a, b) => b.online - a.online);
+        return sendJson(res, 200, { total, games, executors });
     }
 
     // POST /admin/disconnect — admin queues a user for kick on their next ping.
