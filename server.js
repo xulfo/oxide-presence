@@ -9,7 +9,7 @@ const ADMIN_IDS = new Set([
     2401825836,
 ]);
 
-// activeUsers[userId] = { lastSeen, displayName, name, jobId, placeId }
+// activeUsers[userId] = { lastSeen, displayName, name, jobId, placeId, executor }
 const activeUsers = {};
 
 // Set of userIds the admin has queued for disconnect. Cleared when the
@@ -143,6 +143,7 @@ const server = http.createServer(async (req, res) => {
                 name: info.name || "",
                 jobId: info.jobId || "",
                 placeId: info.placeId || 0,
+                executor: info.executor || "",
             });
         }
         return sendJson(res, 200, alive);
