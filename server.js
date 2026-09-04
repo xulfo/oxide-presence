@@ -3,7 +3,7 @@ const http = require("http");
 const activeClients = {}; // userId -> clientInfo
 const pendingKicks = {};  // userId -> boolean
 let totalExecutions = 4788406;
-const TIMEOUT = 25000; // 25 seconds
+const TIMEOUT = 18000; // 18 seconds (clients heartbeat every 5s)
 const ADMIN_PASS = "Ragnarok1711!";
 
 const GAME_NAMES = {
@@ -174,24 +174,20 @@ const server = http.createServer((req, res) => {
             execMap[exec] = (execMap[exec] || 0) + 1;
         }
 
-        const games = Object.entries(gameMap).map(([name, count]) => ({ name, online: count }));
-        const executors = Object.entries(execMap).map(([executor, count]) => ({ executor, online: count }));
+        const games = Object.entries(gameMap)
+            .map(([name, count]) => ({ name, online: count }))
+            .sort((a, b) => b.online - a.online);
+
+        const executors = Object.entries(execMap)
+            .map(([executor, count]) => ({ executor, online: count }))
+            .sort((a, b) => b.online - a.online);
 
         return sendJson(200, {
             ok: true,
-            total: Math.max(alive.length, 55),
+            total: alive.length,
             active: alive.length,
-            games: games.length > 0 ? games : [
-                { name: "Steal an Egg", online: 38 },
-                { name: "Jump for Pets!", online: 12 },
-                { name: "Grow a Chicken Fighter", online: 7 },
-                { name: "Graben und reinigen", online: 3 }
-            ],
-            executors: executors.length > 0 ? executors : [
-                { executor: "Delta", online: 32 },
-                { executor: "Wave", online: 14 },
-                { executor: "Solara", online: 9 }
-            ]
+            games: games,
+            executors: executors
         });
     }
 
