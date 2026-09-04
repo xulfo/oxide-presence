@@ -30,6 +30,35 @@ const BASELINE_GAMES = [
     { name: "Leaf Simulator", launches: 11500, place_id: 100068273119174 }
 ];
 
+const avatarCache = {};
+
+async function resolveAvatars(clients) {
+    const missing = clients.filter(c => !avatarCache[c.userId]).map(c => c.userId);
+    if (missing.length === 0) return;
+    for (let i = 0; i < missing.length; i += 50) {
+        const chunk = missing.slice(i, i + 50);
+        try {
+            await new Promise(resolve => {
+                const https = require("https");
+                const url = `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${chunk.join(",")}&size=150x150&format=Png&isCircular=false`;
+                https.get(url, res => {
+                    let d = "";
+                    res.on("data", c => d += c);
+                    res.on("end", () => {
+                        try {
+                            const j = JSON.parse(d);
+                            (j.data || []).forEach(item => {
+                                if (item.imageUrl) avatarCache[item.targetId] = item.imageUrl;
+                            });
+                        } catch (_) {}
+                        resolve();
+                    });
+                }).on("error", () => resolve());
+            });
+        } catch (_) {}
+    }
+}
+
 function getAliveClients() {
     const now = Date.now();
     return Object.values(activeClients).filter(c => now - c.ts < TIMEOUT);
@@ -240,10 +269,21 @@ const server = http.createServer((req, res) => {
             return sendJson(401, { error: "Authentication required" });
         }
         const alive = getAliveClients();
-        return sendJson(200, {
-            ok: true,
-            clients: alive
+        resolveAvatars(alive).then(() => {
+            for (const c of alive) {
+                c.avatar_url = avatarCache[c.userId] || `https://tr.rbxcdn.com/30DAY-AvatarHeadshot-71848267B8C2DFDB127CB5A451F6780E-Png/150/150/AvatarHeadshot/Png/noFilter`;
+            }
+            sendJson(200, {
+                ok: true,
+                clients: alive
+            });
+        }).catch(() => {
+            sendJson(200, {
+                ok: true,
+                clients: alive
+            });
         });
+        return;
     }
 
     // POST /admin/api/kick — queue client for disconnect
