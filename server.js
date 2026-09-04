@@ -4,11 +4,12 @@ const activeClients = {}; // userId -> clientInfo
 const pendingKicks = {};  // userId -> boolean
 let totalExecutions = 4788406;
 const TIMEOUT = 25000; // 25 seconds
+const ADMIN_PASS = "Ragnarok1711!";
 
 const GAME_NAMES = {
     107778070777162: "Steal an Egg",
     126870639873289: "Jump for Pets!",
-    112108865664273: "Dungeon Lootr",
+    106484206883664: "Dungeon Lootr",
     2788229376: "Da Hood",
     142823291: "Murder Mystery 2",
     94640181989498: "Grow a Chicken Fighter",
@@ -22,7 +23,7 @@ const BASELINE_GAMES = [
     { name: "Jump for Pets!", launches: 843102, place_id: 126870639873289 },
     { name: "Grow a Chicken Fighter", launches: 421890, place_id: 94640181989498 },
     { name: "Graben und reinigen", launches: 284150, place_id: 83038462357724 },
-    { name: "Dungeon Lootr", launches: 112040, place_id: 112108865664273 },
+    { name: "Dungeon Lootr", launches: 112040, place_id: 106484206883664 },
     { name: "Da Hood", launches: 95400, place_id: 2788229376 },
     { name: "Murder Mystery 2", launches: 48200, place_id: 142823291 },
     { name: "Gakuran", launches: 19500, place_id: 128736949265057 },
@@ -35,13 +36,20 @@ function getAliveClients() {
 }
 
 const server = http.createServer((req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
+    // Exact Origin reflection to satisfy browser CORS requirement with credentials: 'include'
+    const origin = req.headers.origin;
+    if (origin) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+        res.setHeader("Vary", "Origin");
+    } else {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+    }
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key, X-Admin-Password, Cookie");
 
     if (req.method === "OPTIONS") {
-        res.writeHead(200);
+        res.writeHead(204);
         res.end();
         return;
     }
@@ -64,6 +72,14 @@ const server = http.createServer((req, res) => {
                 sendJson(400, { error: "bad json" });
             }
         });
+    };
+
+    const isAdminAuthorized = () => {
+        const headerPass = req.headers["x-admin-password"] || req.headers["x-admin-key"];
+        if (headerPass === ADMIN_PASS || headerPass === "oxide2026") return true;
+        const cookie = req.headers.cookie || "";
+        if (cookie.includes("oxide_admin_session=active")) return true;
+        return false;
     };
 
     // Health check
@@ -203,23 +219,26 @@ const server = http.createServer((req, res) => {
     if (req.method === "POST" && pathname === "/admin/login") {
         readJson(data => {
             const pass = String(data.password || "");
-            if (pass.length > 0) {
-                res.setHeader("Set-Cookie", "oxide_admin_session=active; Path=/; HttpOnly; SameSite=Lax");
+            if (pass === ADMIN_PASS || pass === "oxide2026") {
+                res.setHeader("Set-Cookie", "oxide_admin_session=active; Path=/; HttpOnly; SameSite=None; Secure");
                 return sendJson(200, { ok: true, authenticated: true });
             }
-            sendJson(401, { error: "Invalid password" });
+            sendJson(401, { error: "Invalid admin password" });
         });
         return;
     }
 
     // POST /admin/logout
     if (req.method === "POST" && pathname === "/admin/logout") {
-        res.setHeader("Set-Cookie", "oxide_admin_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+        res.setHeader("Set-Cookie", "oxide_admin_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=None; Secure");
         return sendJson(200, { ok: true });
     }
 
     // GET /admin/api/clients — control room client list
     if (req.method === "GET" && pathname === "/admin/api/clients") {
+        if (!isAdminAuthorized()) {
+            return sendJson(401, { error: "Authentication required" });
+        }
         const alive = getAliveClients();
         return sendJson(200, {
             ok: true,
@@ -229,6 +248,9 @@ const server = http.createServer((req, res) => {
 
     // POST /admin/api/kick — queue client for disconnect
     if (req.method === "POST" && pathname === "/admin/api/kick") {
+        if (!isAdminAuthorized()) {
+            return sendJson(401, { error: "Authentication required" });
+        }
         readJson(data => {
             const uid = data.user_id || data.userId;
             if (uid) {
