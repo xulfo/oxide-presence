@@ -38,6 +38,20 @@ const BASELINE_GAMES = [
     { name: "Search For The Needle", launches: 1500, place_id: 108628039999641 }
 ];
 
+// place_id -> universe_id (used by the /banner route to fetch real game thumbnails)
+const UNIVERSE_IDS = {
+    107778070777162: 10563114921,
+    126870639873289: 10690360998,
+    94640181989498: 10338952197,
+    83038462357724: 10475794799,
+    106484206883664: 9656201728,
+    2788229376: 1008451066,
+    142823291: 66654135,
+    128736949265057: 9199655655,
+    100068273119174: 10539411000,
+    108628039999641: 10756011174
+};
+
 const avatarCache = {};
 
 async function resolveAvatars(clients) {
@@ -267,6 +281,39 @@ const server = http.createServer((req, res) => {
             end_date: now.toISOString().slice(0, 10),
             series: series
         });
+    }
+
+    // GET /banner/:name — real game card banner (redirects to the Roblox thumbnail).
+    // The website falls back to ${API_BASE}/banner/<name>.webp for any game that
+    // has no hardcoded banner, so every supported game gets a real thumbnail.
+    if (req.method === "GET" && pathname.startsWith("/banner/")) {
+        const gName = decodeURIComponent(pathname.replace("/banner/", "").replace(/\.webp$/i, ""));
+        const matched = BASELINE_GAMES.find(g => g.name.toLowerCase() === gName.toLowerCase());
+        if (!matched || !UNIVERSE_IDS[matched.place_id]) {
+            return sendJson(404, { error: "unknown game" });
+        }
+        const universeId = UNIVERSE_IDS[matched.place_id];
+        const https = require("https");
+        const apiPath = `/v1/games/multiget/thumbnails?universeIds=${universeId}&countPerUniverse=1&defaults=true&size=768x432&format=Png&isCircular=false`;
+        https.get({ host: "thumbnails.roblox.com", path: apiPath, headers: { "User-Agent": "oxide-hub" } }, r2 => {
+            let d = "";
+            r2.on("data", c => d += c);
+            r2.on("end", () => {
+                try {
+                    const j = JSON.parse(d);
+                    const img = j.data && j.data[0] && j.data[0].thumbnails && j.data[0].thumbnails[0] && j.data[0].thumbnails[0].imageUrl;
+                    if (img) {
+                        res.writeHead(302, { Location: img });
+                        res.end();
+                    } else {
+                        sendJson(404, { error: "no thumbnail" });
+                    }
+                } catch (e) {
+                    sendJson(500, { error: "bad upstream" });
+                }
+            });
+        }).on("error", () => sendJson(502, { error: "upstream down" }));
+        return;
     }
 
     // POST /admin/login
