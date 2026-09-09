@@ -22,7 +22,8 @@ const GAME_NAMES = {
     128736949265057: "Gakuran",
     100068273119174: "Leaf Simulator",
     108628039999641: "Search For The Needle",
-    77108422251420: "Search For The Needle"
+    77108422251420: "Search For The Needle",
+    17625359962: "RIVALS"
 };
 
 const BASELINE_GAMES = [
@@ -35,7 +36,8 @@ const BASELINE_GAMES = [
     { name: "Murder Mystery 2", launches: 48200, place_id: 142823291 },
     { name: "Gakuran", launches: 19500, place_id: 128736949265057 },
     { name: "Leaf Simulator", launches: 11500, place_id: 100068273119174 },
-    { name: "Search For The Needle", launches: 1500, place_id: 108628039999641 }
+    { name: "Search For The Needle", launches: 1500, place_id: 108628039999641 },
+    { name: "RIVALS", launches: 2500, place_id: 17625359962 }
 ];
 
 // place_id -> universe_id (used by the /banner route to fetch real game thumbnails)
@@ -49,7 +51,8 @@ const UNIVERSE_IDS = {
     142823291: 66654135,
     128736949265057: 9199655655,
     100068273119174: 10539411000,
-    108628039999641: 10756011174
+    108628039999641: 10756011174,
+    17625359962: 6035872082
 };
 
 const avatarCache = {};
@@ -135,7 +138,7 @@ const server = http.createServer((req, res) => {
 
     // Health check
     if (pathname === "/" || pathname === "/health") {
-        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: 11 });
+        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: 12 });
     }
 
     // POST /register — Roblox client reports active presence
