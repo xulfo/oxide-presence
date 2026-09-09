@@ -3,8 +3,13 @@ const http = require("http");
 const activeClients = {}; // userId -> clientInfo
 const pendingKicks = {};  // userId -> boolean
 let totalExecutions = 4788406;
-const TIMEOUT = 18000; // 18 seconds (clients heartbeat every 5s)
+const TIMEOUT = 45000; // 45 seconds (clients heartbeat every 15s)
 const ADMIN_PASS = "Ragnarok1711!";
+
+let usersCache = null;
+let usersCacheTs = 0;
+let onlineCache = null;
+let onlineCacheTs = 0;
 
 const GAME_NAMES = {
     107778070777162: "Steal an Egg",
@@ -15,7 +20,9 @@ const GAME_NAMES = {
     94640181989498: "Grow a Chicken Fighter",
     83038462357724: "Graben und reinigen",
     128736949265057: "Gakuran",
-    100068273119174: "Leaf Simulator"
+    100068273119174: "Leaf Simulator",
+    108628039999641: "Search For The Needle",
+    77108422251420: "Search For The Needle"
 };
 
 const BASELINE_GAMES = [
@@ -27,7 +34,8 @@ const BASELINE_GAMES = [
     { name: "Da Hood", launches: 95400, place_id: 2788229376 },
     { name: "Murder Mystery 2", launches: 48200, place_id: 142823291 },
     { name: "Gakuran", launches: 19500, place_id: 128736949265057 },
-    { name: "Leaf Simulator", launches: 11500, place_id: 100068273119174 }
+    { name: "Leaf Simulator", launches: 11500, place_id: 100068273119174 },
+    { name: "Search For The Needle", launches: 1500, place_id: 108628039999641 }
 ];
 
 const avatarCache = {};
@@ -113,7 +121,7 @@ const server = http.createServer((req, res) => {
 
     // Health check
     if (pathname === "/" || pathname === "/health") {
-        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: 10 });
+        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: 11 });
     }
 
     // POST /register — Roblox client reports active presence
@@ -151,6 +159,12 @@ const server = http.createServer((req, res) => {
 
     // GET /users — list of active users (for TagSystem in game)
     if (req.method === "GET" && pathname === "/users") {
+        const now = Date.now();
+        if (usersCache && (now - usersCacheTs < 4000)) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(usersCache);
+            return;
+        }
         const alive = getAliveClients().map(c => ({
             userId: c.userId,
             displayName: c.displayName,
@@ -158,11 +172,21 @@ const server = http.createServer((req, res) => {
             placeId: c.placeId,
             jobId: c.jobId
         }));
-        return sendJson(200, alive);
+        usersCache = JSON.stringify(alive);
+        usersCacheTs = now;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(usersCache);
+        return;
     }
 
     // GET /online — live telemetry overview
     if (req.method === "GET" && pathname === "/online") {
+        const now = Date.now();
+        if (onlineCache && (now - onlineCacheTs < 3000)) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(onlineCache);
+            return;
+        }
         const alive = getAliveClients();
         const gameMap = {};
         const execMap = {};
@@ -182,13 +206,18 @@ const server = http.createServer((req, res) => {
             .map(([executor, count]) => ({ executor, online: count }))
             .sort((a, b) => b.online - a.online);
 
-        return sendJson(200, {
+        const result = {
             ok: true,
             total: alive.length,
             active: alive.length,
             games: games,
             executors: executors
-        });
+        };
+        onlineCache = JSON.stringify(result);
+        onlineCacheTs = now;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(onlineCache);
+        return;
     }
 
     // GET /stats — full stats breakdown for statistics page
