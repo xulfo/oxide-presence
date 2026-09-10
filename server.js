@@ -7,21 +7,34 @@ let totalExecutions = 4788406;
 // User-generated profiles for the short-link profile pages (/<handle>).
 // Kept in memory (optionally mirrored to ./profiles.json so restarts keep data).
 const profiles = {}; // handle -> profile object
+const media = {};    // media id -> mp3 Buffer (served at /media/<id>.mp3)
+
+const crypto = require("crypto");
+const fs = require("fs");
+
+try {
+    if (fs.existsSync("./media")) {
+        for (const f of fs.readdirSync("./media")) {
+            if (f.endsWith(".mp3")) media[f.replace(/\.mp3$/, "")] = fs.readFileSync("./media/" + f);
+        }
+    }
+} catch (_) {}
+
 const RESERVED_HANDLES = new Set([
     "lesy", "create", "profile", "script", "admin", "assets", "games",
     "statistics", "updates", "server", "index", "loader", "api", "u", "404"
 ]);
 
 try {
-    if (require("fs").existsSync("./profiles.json")) {
-        const saved = JSON.parse(require("fs").readFileSync("./profiles.json", "utf8"));
+    if (fs.existsSync("./profiles.json")) {
+        const saved = JSON.parse(fs.readFileSync("./profiles.json", "utf8"));
         Object.assign(profiles, saved);
     }
 } catch (_) {}
 
 function persistProfiles() {
     try {
-        require("fs").writeFileSync("./profiles.json", JSON.stringify(profiles));
+        fs.writeFileSync("./profiles.json", JSON.stringify(profiles));
     } catch (_) {}
 }
 const TIMEOUT = 45000; // 45 seconds (clients heartbeat every 15s)
@@ -171,12 +184,61 @@ const server = http.createServer((req, res) => {
         return sendJson(200, { ok: true, service: "oxide-hub", supported_games: uniqueNames.size });
     }
 
+    // POST /media — upload an MP3 (raw body) for profile background music
+    if (req.method === "POST" && pathname === "/media") {
+        const chunks = [];
+        let size = 0;
+        let tooBig = false;
+        req.on("data", c => {
+            size += c.length;
+            if (size > 6 * 1024 * 1024) tooBig = true;
+            else chunks.push(c);
+        });
+        req.on("end", () => {
+            if (tooBig) return sendJson(413, { error: "file too large (max 6MB)" });
+            const buf = Buffer.concat(chunks);
+            if (buf.length === 0) return sendJson(400, { error: "empty file" });
+            const id = crypto.randomBytes(8).toString("hex");
+            media[id] = buf;
+            try { fs.writeFileSync("./media/" + id + ".mp3", buf); } catch (_) {}
+            return sendJson(200, { ok: true, url: "https://adorable-sallyanne-fgdfgdfgd-b2d051be.koyeb.app/media/" + id + ".mp3" });
+        });
+        return;
+    }
+
+    // GET /media/:id.mp3 — serve an uploaded background music file
+    if (req.method === "GET" && pathname.startsWith("/media/")) {
+        const id = pathname.replace("/media/", "").replace(/\.mp3$/i, "");
+        const buf = media[id];
+        if (!buf) return sendJson(404, { error: "media not found" });
+        res.writeHead(200, {
+            "Content-Type": "audio/mpeg",
+            "Content-Length": buf.length,
+            "Cache-Control": "public, max-age=86400"
+        });
+        res.end(buf);
+        return;
+    }
+
     // GET /profile/:handle — fetch a generated user profile
     if (req.method === "GET" && pathname.startsWith("/profile/")) {
         const handle = decodeURIComponent(pathname.replace("/profile/", "")).toLowerCase();
         const p = profiles[handle];
         if (!p) return sendJson(404, { error: "profile not found" });
-        return sendJson(200, { ok: true, handle: handle, profile: p });
+        return sendJson(200, {
+            ok: true,
+            handle: handle,
+            profile: {
+                name: p.name,
+                status: p.status,
+                bio: p.bio,
+                avatar: p.avatar,
+                background: p.background,
+                tags: p.tags,
+                links: p.links,
+                music: p.music || ""
+            }
+        });
     }
 
     // POST /profile — create or update a user profile (short link page)
@@ -189,6 +251,12 @@ const server = http.createServer((req, res) => {
             if (RESERVED_HANDLES.has(handle)) {
                 return sendJson(409, { error: "this handle is reserved" });
             }
+            const existing = profiles[handle];
+            const providedToken = String(data.editToken || "");
+            if (existing && providedToken !== existing.editToken) {
+                return sendJson(409, { error: "this handle is already taken" });
+            }
+            const editToken = existing ? existing.editToken : crypto.randomBytes(16).toString("hex");
             const links = Array.isArray(data.links)
                 ? data.links.slice(0, 8)
                     .map(l => ({ label: String((l && l.label) || "").slice(0, 30), url: String((l && l.url) || "").slice(0, 1000) }))
@@ -202,10 +270,12 @@ const server = http.createServer((req, res) => {
                 background: String(data.background || "").slice(0, 1000),
                 tags: String(data.tags || "").slice(0, 200),
                 links: links,
+                music: String(data.music || "").slice(0, 1000),
+                editToken: editToken,
                 updated: Date.now()
             };
             persistProfiles();
-            return sendJson(200, { ok: true, handle: handle });
+            return sendJson(200, { ok: true, handle: handle, editToken: editToken });
         });
         return;
     }
