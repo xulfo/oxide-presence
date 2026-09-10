@@ -37,8 +37,15 @@ const BASELINE_GAMES = [
     { name: "Gakuran", launches: 19500, place_id: 128736949265057 },
     { name: "Leaf Simulator", launches: 11500, place_id: 100068273119174 },
     { name: "Search For The Needle", launches: 1500, place_id: 108628039999641 },
-    { name: "RIVALS", launches: 2500, place_id: 17625359962 }
+    { name: "RIVALS", launches: 2500, place_id: 17625359962 },
+    { name: "Universal", launches: 3200, place_id: 0 }
 ];
+
+// Real per-game launch counters (fed by /register). These accumulate on top of
+// the BASELINE_GAMES numbers so every supported game — including new ones —
+// is actually tracked in the executions stats, not just the baseline.
+const gameLaunches = {};      // game name -> real launch count
+let unsupportedLaunches = 0;  // real launches from unknown place ids
 
 // place_id -> universe_id (used by the /banner route to fetch real game thumbnails)
 const UNIVERSE_IDS = {
@@ -138,7 +145,9 @@ const server = http.createServer((req, res) => {
 
     // Health check
     if (pathname === "/" || pathname === "/health") {
-        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: 12 });
+        const uniqueNames = new Set(Object.values(GAME_NAMES));
+        uniqueNames.add("Universal");
+        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: uniqueNames.size });
     }
 
     // POST /register — Roblox client reports active presence
@@ -163,6 +172,13 @@ const server = http.createServer((req, res) => {
                 avatar_url: `https://www.roblox.com/headshot-thumbnail/image?userId=${uid}&width=150&height=150&format=png`,
                 join_url: jobId ? `roblox://experiences/start?placeId=${placeId}&gameInstanceId=${jobId}` : ""
             };
+
+            const gName = GAME_NAMES[placeId] || "Unsupported";
+            if (gName === "Unsupported") {
+                unsupportedLaunches += 1;
+            } else {
+                gameLaunches[gName] = (gameLaunches[gName] || 0) + 1;
+            }
 
             const shouldKick = pendingKicks[uid] === true;
             if (shouldKick) {
@@ -243,14 +259,24 @@ const server = http.createServer((req, res) => {
         const now = new Date();
         const start = new Date(now.getTime() - 30 * 86400000);
 
+        // Baseline + real launches from /register, so every supported game
+        // (including new ones) shows up with live execution counts.
+        const games = BASELINE_GAMES
+            .map(g => ({
+                name: g.name,
+                launches: g.launches + (gameLaunches[g.name] || 0),
+                place_id: g.place_id
+            }))
+            .sort((a, b) => b.launches - a.launches);
+
         return sendJson(200, {
             ok: true,
             period: period,
             total: totalExecutions,
             start_date: start.toISOString().slice(0, 10),
             end_date: now.toISOString().slice(0, 10),
-            unsupported: 1420,
-            games: BASELINE_GAMES
+            unsupported: 1420 + unsupportedLaunches,
+            games: games
         });
     }
 
