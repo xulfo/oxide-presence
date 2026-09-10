@@ -488,6 +488,33 @@ const server = http.createServer((req, res) => {
         return sendJson(200, { ok: true });
     }
 
+    // GET /profile/me — the logged-in Discord user's own profile (for the editor prefill)
+    if (req.method === "GET" && pathname === "/profile/me") {
+        const sessionUser = getSessionUser();
+        if (!sessionUser) return sendJson(401, { error: "not logged in" });
+        for (const h in profiles) {
+            const p = profiles[h];
+            if (p.discordId === sessionUser.discordId) {
+                return sendJson(200, {
+                    ok: true,
+                    handle: h,
+                    profile: {
+                        name: p.name,
+                        status: p.status,
+                        bio: p.bio,
+                        avatar: p.avatar,
+                        background: p.background,
+                        tags: p.tags,
+                        links: p.links,
+                        music: p.music || "",
+                        logoTag: p.logoTag || { text: "", image: "", color: "#81a3d6" }
+                    }
+                });
+            }
+        }
+        return sendJson(404, { ok: false, error: "no profile yet" });
+    }
+
     // GET /profile/:handle — fetch a generated user profile
     if (req.method === "GET" && pathname.startsWith("/profile/")) {
         const handle = decodeURIComponent(pathname.replace("/profile/", "")).toLowerCase();
