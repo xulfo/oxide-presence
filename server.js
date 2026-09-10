@@ -20,6 +20,69 @@ const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://get-oxide.com";
 const oauthStates = {}; // oauth state -> createdAt
 const sessions = {};    // session token -> discord user info
 
+// GitHub-backed persistence so profiles + media survive redeploys.
+const GH_DATA_TOKEN = process.env.GH_DATA_TOKEN || ""; // set via Koyeb env (never commit tokens)
+const GH_DATA_REPO = "xulfo/oxide-presence";
+const GH_DATA_PATH = "profiles.json";
+
+function ghApi(method, path, body) {
+    if (!GH_DATA_TOKEN) return Promise.resolve({ status: 401, body: "{}" });
+    return new Promise((resolve, reject) => {
+        const https = require("https");
+        const data = body ? JSON.stringify(body) : null;
+        const req = https.request({
+            host: "api.github.com",
+            path: path,
+            method: method,
+            headers: {
+                "User-Agent": "oxide-hub",
+                Authorization: "token " + GH_DATA_TOKEN,
+                Accept: "application/vnd.github+json",
+                ...(data ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } : {})
+            }
+        }, res => {
+            let d = "";
+            res.on("data", c => d += c);
+            res.on("end", () => resolve({ status: res.statusCode, body: d }));
+        });
+        req.on("error", reject);
+        if (data) req.write(data);
+        req.end();
+    });
+}
+
+async function loadProfilesFromGitHub() {
+    try {
+        const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${GH_DATA_PATH}`);
+        if (res.status === 200) {
+            const j = JSON.parse(res.body);
+            const saved = JSON.parse(Buffer.from(j.content, "base64").toString("utf8"));
+            Object.assign(profiles, saved);
+            console.log("Loaded " + Object.keys(saved).length + " profiles from GitHub");
+        }
+    } catch (e) {
+        console.log("GitHub profiles load failed: " + e.message);
+    }
+}
+
+async function loadMediaFromGitHub() {
+    try {
+        const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/media`);
+        if (res.status === 200) {
+            const files = JSON.parse(res.body);
+            for (const f of files) {
+                if (f.name && f.name.endsWith(".mp3")) {
+                    const fc = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/media/${f.name}`);
+                    if (fc.status === 200) media[f.name.replace(/\.mp3$/, "")] = Buffer.from(JSON.parse(fc.body).content, "base64");
+                }
+            }
+            console.log("Loaded " + Object.keys(media).length + " media files from GitHub");
+        }
+    } catch (e) {
+        console.log("GitHub media load skipped: " + e.message);
+    }
+}
+
 try {
     if (fs.existsSync("./media")) {
         for (const f of fs.readdirSync("./media")) {
@@ -50,6 +113,17 @@ function persistProfiles() {
     try {
         fs.writeFileSync("./profiles.json", JSON.stringify(profiles));
     } catch (_) {}
+    // Async mirror to GitHub so profiles survive redeploys.
+    ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${GH_DATA_PATH}`).then(async (res) => {
+        const payload = {
+            content: Buffer.from(JSON.stringify(profiles), "utf8").toString("base64"),
+            message: "profiles update",
+            branch: "main"
+        };
+        if (res.status === 200) payload.sha = JSON.parse(res.body).sha;
+        const put = await ghApi("PUT", `/repos/${GH_DATA_REPO}/contents/${GH_DATA_PATH}`, payload);
+        if (put.status !== 200 && put.status !== 201) console.log("GitHub profiles save skipped (" + put.status + ")");
+    }).catch(() => {});
 }
 const TIMEOUT = 45000; // 45 seconds (clients heartbeat every 15s)
 const ADMIN_PASS = "Ragnarok1711!";
@@ -144,6 +218,9 @@ function getAliveClients() {
     return Object.values(activeClients).filter(c => now - c.ts < TIMEOUT);
 }
 
+loadProfilesFromGitHub();
+loadMediaFromGitHub();
+
 const server = http.createServer((req, res) => {
     // Exact Origin reflection to satisfy browser CORS requirement with credentials: 'include'
     const origin = req.headers.origin;
@@ -215,6 +292,12 @@ const server = http.createServer((req, res) => {
             const id = crypto.randomBytes(8).toString("hex");
             media[id] = buf;
             try { fs.writeFileSync("./media/" + id + ".mp3", buf); } catch (_) {}
+            // Mirror to GitHub so uploaded music survives redeploys.
+            ghApi("GET", `/repos/${GH_DATA_REPO}/contents/media/${id}.mp3`).then(async (res) => {
+                const payload = { content: buf.toString("base64"), message: "media " + id, branch: "main" };
+                if (res.status === 200) payload.sha = JSON.parse(res.body).sha;
+                await ghApi("PUT", `/repos/${GH_DATA_REPO}/contents/media/${id}.mp3`, payload);
+            }).catch(() => {});
             return sendJson(200, { ok: true, url: "https://adorable-sallyanne-fgdfgdfgd-b2d051be.koyeb.app/media/" + id + ".mp3" });
         });
         return;
