@@ -3,6 +3,27 @@ const http = require("http");
 const activeClients = {}; // userId -> clientInfo
 const pendingKicks = {};  // userId -> boolean
 let totalExecutions = 4788406;
+
+// User-generated profiles for the short-link profile pages (/<handle>).
+// Kept in memory (optionally mirrored to ./profiles.json so restarts keep data).
+const profiles = {}; // handle -> profile object
+const RESERVED_HANDLES = new Set([
+    "lesy", "create", "profile", "script", "admin", "assets", "games",
+    "statistics", "updates", "server", "index", "loader", "api", "u", "404"
+]);
+
+try {
+    if (require("fs").existsSync("./profiles.json")) {
+        const saved = JSON.parse(require("fs").readFileSync("./profiles.json", "utf8"));
+        Object.assign(profiles, saved);
+    }
+} catch (_) {}
+
+function persistProfiles() {
+    try {
+        require("fs").writeFileSync("./profiles.json", JSON.stringify(profiles));
+    } catch (_) {}
+}
 const TIMEOUT = 45000; // 45 seconds (clients heartbeat every 15s)
 const ADMIN_PASS = "Ragnarok1711!";
 
@@ -148,6 +169,45 @@ const server = http.createServer((req, res) => {
         const uniqueNames = new Set(Object.values(GAME_NAMES));
         uniqueNames.add("Universal");
         return sendJson(200, { ok: true, service: "oxide-hub", supported_games: uniqueNames.size });
+    }
+
+    // GET /profile/:handle — fetch a generated user profile
+    if (req.method === "GET" && pathname.startsWith("/profile/")) {
+        const handle = decodeURIComponent(pathname.replace("/profile/", "")).toLowerCase();
+        const p = profiles[handle];
+        if (!p) return sendJson(404, { error: "profile not found" });
+        return sendJson(200, { ok: true, handle: handle, profile: p });
+    }
+
+    // POST /profile — create or update a user profile (short link page)
+    if (req.method === "POST" && pathname === "/profile") {
+        readJson(data => {
+            const handle = String(data.handle || "").toLowerCase();
+            if (!/^[a-z0-9_]{2,24}$/.test(handle)) {
+                return sendJson(400, { error: "invalid handle — use 2-24 letters, numbers or underscores" });
+            }
+            if (RESERVED_HANDLES.has(handle)) {
+                return sendJson(409, { error: "this handle is reserved" });
+            }
+            const links = Array.isArray(data.links)
+                ? data.links.slice(0, 8)
+                    .map(l => ({ label: String((l && l.label) || "").slice(0, 30), url: String((l && l.url) || "").slice(0, 1000) }))
+                    .filter(l => l.url)
+                : [];
+            profiles[handle] = {
+                name: String(data.name || handle).slice(0, 32),
+                status: String(data.status || "Available").slice(0, 24),
+                bio: String(data.bio || "").slice(0, 500),
+                avatar: String(data.avatar || "").slice(0, 1000),
+                background: String(data.background || "").slice(0, 1000),
+                tags: String(data.tags || "").slice(0, 200),
+                links: links,
+                updated: Date.now()
+            };
+            persistProfiles();
+            return sendJson(200, { ok: true, handle: handle });
+        });
+        return;
     }
 
     // POST /register — Roblox client reports active presence
