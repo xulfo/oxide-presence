@@ -12,6 +12,14 @@ const media = {};    // media id -> mp3 Buffer (served at /media/<id>.mp3)
 const crypto = require("crypto");
 const fs = require("fs");
 
+// Discord OAuth — required to create/edit profiles
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
+const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI || "https://adorable-sallyanne-fgdfgdfgd-b2d051be.koyeb.app/auth/discord/callback";
+const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://get-oxide.com";
+const oauthStates = {}; // oauth state -> createdAt
+const sessions = {};    // session token -> discord user info
+
 try {
     if (fs.existsSync("./media")) {
         for (const f of fs.readdirSync("./media")) {
@@ -24,6 +32,12 @@ const RESERVED_HANDLES = new Set([
     "lesy", "create", "profile", "script", "admin", "assets", "games",
     "statistics", "updates", "server", "index", "loader", "api", "u", "404"
 ]);
+const PROFILE_STATUSES = new Set(["Online", "Do not disturb", "Offline"]);
+
+function normalizeStatus(value) {
+    const status = String(value || "Online");
+    return PROFILE_STATUSES.has(status) ? status : "Online";
+}
 
 try {
     if (fs.existsSync("./profiles.json")) {
@@ -220,6 +234,132 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ---- Discord OAuth ----
+    const getSessionUser = () => {
+        const cookie = req.headers.cookie || "";
+        const m = cookie.match(/oxide_discord_session=([^;]+)/);
+        if (!m) return null;
+        return sessions[m[1]] || null;
+    };
+
+    if (req.method === "GET" && pathname === "/auth/discord/login") {
+        if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+            res.writeHead(302, { Location: SITE_ORIGIN + "/create/?error=not_configured" });
+            res.end();
+            return;
+        }
+        const state = crypto.randomBytes(16).toString("hex");
+        oauthStates[state] = Date.now();
+        const url = "https://discord.com/api/oauth2/authorize?client_id=" + encodeURIComponent(DISCORD_CLIENT_ID)
+            + "&redirect_uri=" + encodeURIComponent(DISCORD_REDIRECT_URI)
+            + "&response_type=code&scope=identify&state=" + state + "&prompt=consent";
+        res.writeHead(302, { Location: url });
+        res.end();
+        return;
+    }
+
+    if (req.method === "GET" && pathname === "/auth/discord/callback") {
+        const code = parsedUrl.searchParams.get("code");
+        const state = parsedUrl.searchParams.get("state");
+        if (!code || !state || !oauthStates[state]) {
+            res.writeHead(302, { Location: SITE_ORIGIN + "/create/?error=invalid_state" });
+            res.end();
+            return;
+        }
+        delete oauthStates[state];
+        const https = require("https");
+        const postData = "client_id=" + encodeURIComponent(DISCORD_CLIENT_ID)
+            + "&client_secret=" + encodeURIComponent(DISCORD_CLIENT_SECRET)
+            + "&grant_type=authorization_code"
+            + "&code=" + encodeURIComponent(code)
+            + "&redirect_uri=" + encodeURIComponent(DISCORD_REDIRECT_URI);
+        const tokenReq = https.request({
+            host: "discord.com",
+            path: "/api/oauth2/token",
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": Buffer.byteLength(postData),
+                "User-Agent": "oxide-hub"
+            }
+        }, tokenRes => {
+            let d = "";
+            tokenRes.on("data", c => d += c);
+            tokenRes.on("end", () => {
+                let tokenData;
+                try { tokenData = JSON.parse(d); } catch (e) { tokenData = {}; }
+                const accessToken = tokenData.access_token;
+                if (!accessToken) {
+                    res.writeHead(302, { Location: SITE_ORIGIN + "/create/?error=discord_token" });
+                    res.end();
+                    return;
+                }
+                https.get({
+                    host: "discord.com",
+                    path: "/api/v10/users/@me",
+                    headers: { Authorization: "Bearer " + accessToken, "User-Agent": "oxide-hub" }
+                }, userRes => {
+                    let u = "";
+                    userRes.on("data", c => u += c);
+                    userRes.on("end", () => {
+                        let user;
+                        try { user = JSON.parse(u); } catch (e) { user = null; }
+                        if (!user || !user.id) {
+                            res.writeHead(302, { Location: SITE_ORIGIN + "/create/?error=discord_user" });
+                            res.end();
+                            return;
+                        }
+                        const sessionToken = crypto.randomBytes(24).toString("hex");
+                        sessions[sessionToken] = {
+                            discordId: String(user.id),
+                            username: String(user.username || ""),
+                            displayName: String(user.global_name || user.username || ""),
+                            avatar: user.avatar ? "https://cdn.discordapp.com/avatars/" + user.id + "/" + user.avatar + ".png?size=128" : "",
+                            createdAt: Date.now()
+                        };
+                        res.writeHead(302, {
+                            Location: SITE_ORIGIN + "/create/?login=ok",
+                            "Set-Cookie": "oxide_discord_session=" + sessionToken + "; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=604800"
+                        });
+                        res.end();
+                    });
+                }).on("error", () => {
+                    res.writeHead(302, { Location: SITE_ORIGIN + "/create/?error=discord_upstream" });
+                    res.end();
+                });
+            });
+        });
+        tokenReq.on("error", () => {
+            res.writeHead(302, { Location: SITE_ORIGIN + "/create/?error=discord_upstream" });
+            res.end();
+        });
+        tokenReq.write(postData);
+        tokenReq.end();
+        return;
+    }
+
+    if (req.method === "GET" && pathname === "/auth/me") {
+        const sessionUser = getSessionUser();
+        if (!sessionUser) return sendJson(401, { error: "not authenticated" });
+        return sendJson(200, {
+            ok: true,
+            user: {
+                discordId: sessionUser.discordId,
+                username: sessionUser.username,
+                displayName: sessionUser.displayName,
+                avatar: sessionUser.avatar
+            }
+        });
+    }
+
+    if (req.method === "POST" && pathname === "/auth/logout") {
+        const cookie = req.headers.cookie || "";
+        const m = cookie.match(/oxide_discord_session=([^;]+)/);
+        if (m) delete sessions[m[1]];
+        res.setHeader("Set-Cookie", "oxide_discord_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=None; Secure");
+        return sendJson(200, { ok: true });
+    }
+
     // GET /profile/:handle — fetch a generated user profile
     if (req.method === "GET" && pathname.startsWith("/profile/")) {
         const handle = decodeURIComponent(pathname.replace("/profile/", "")).toLowerCase();
@@ -236,13 +376,52 @@ const server = http.createServer((req, res) => {
                 background: p.background,
                 tags: p.tags,
                 links: p.links,
-                music: p.music || ""
+                music: p.music || "",
+                logoTag: p.logoTag || { text: "", image: "", color: "#81a3d6" }
             }
         });
     }
 
-    // POST /profile — create or update a user profile (short link page)
+    // GET /admin/api/profiles — authenticated profile management list
+    if (req.method === "GET" && pathname === "/admin/api/profiles") {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const list = Object.entries(profiles).map(([handle, p]) => ({
+            handle,
+            name: p.name,
+            status: p.status,
+            avatar: p.avatar,
+            updated: p.updated,
+            discord: p.discordUser && (p.discordUser.displayName || p.discordUser.username) || null,
+            logoTag: p.logoTag || { text: "", image: "", color: "#81a3d6" }
+        })).sort((a, b) => (b.updated || 0) - (a.updated || 0));
+        return sendJson(200, { ok: true, profiles: list });
+    }
+
+    // PATCH /admin/api/profiles/:handle — award/update a custom profile logo tag
+    if (req.method === "PATCH" && pathname.startsWith("/admin/api/profiles/")) {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const handle = decodeURIComponent(pathname.replace("/admin/api/profiles/", "")).toLowerCase();
+        if (!profiles[handle]) return sendJson(404, { error: "profile not found" });
+        return readJson(data => {
+            const p = profiles[handle];
+            if (data.status !== undefined) p.status = normalizeStatus(data.status);
+            if (data.logoTag !== undefined) {
+                p.logoTag = {
+                    text: String(data.logoTag.text || "").slice(0, 28),
+                    image: String(data.logoTag.image || "").slice(0, 1000),
+                    color: String(data.logoTag.color || "#81a3d6").slice(0, 20)
+                };
+            }
+            p.updated = Date.now();
+            persistProfiles();
+            return sendJson(200, { ok: true, handle, logoTag: p.logoTag, status: p.status });
+        });
+    }
+
+    // POST /profile — create or update a user profile (short link page, Discord login required)
     if (req.method === "POST" && pathname === "/profile") {
+        const sessionUser = getSessionUser();
+        if (!sessionUser) return sendJson(401, { error: "Discord login required to create a profile" });
         readJson(data => {
             const handle = String(data.handle || "").toLowerCase();
             if (!/^[a-z0-9_]{2,24}$/.test(handle)) {
@@ -252,9 +431,18 @@ const server = http.createServer((req, res) => {
                 return sendJson(409, { error: "this handle is reserved" });
             }
             const existing = profiles[handle];
-            const providedToken = String(data.editToken || "");
-            if (existing && providedToken !== existing.editToken) {
+            if (existing && existing.discordId && existing.discordId !== sessionUser.discordId) {
                 return sendJson(409, { error: "this handle is already taken" });
+            }
+            if (existing && !existing.discordId && String(data.editToken || "") !== existing.editToken) {
+                return sendJson(409, { error: "this handle is already taken" });
+            }
+            let ownHandle = null;
+            for (const h in profiles) {
+                if (profiles[h].discordId === sessionUser.discordId) { ownHandle = h; break; }
+            }
+            if (ownHandle && ownHandle !== handle) {
+                return sendJson(409, { error: "you already have a profile at /" + ownHandle + "/ — edit that one instead" });
             }
             const editToken = existing ? existing.editToken : crypto.randomBytes(16).toString("hex");
             const links = Array.isArray(data.links)
@@ -264,14 +452,25 @@ const server = http.createServer((req, res) => {
                 : [];
             profiles[handle] = {
                 name: String(data.name || handle).slice(0, 32),
-                status: String(data.status || "Available").slice(0, 24),
+                status: normalizeStatus(data.status),
                 bio: String(data.bio || "").slice(0, 500),
                 avatar: String(data.avatar || "").slice(0, 1000),
                 background: String(data.background || "").slice(0, 1000),
                 tags: String(data.tags || "").slice(0, 200),
                 links: links,
                 music: String(data.music || "").slice(0, 1000),
+                logoTag: {
+                    text: String((data.logoTag && data.logoTag.text) || "").slice(0, 28),
+                    image: String((data.logoTag && data.logoTag.image) || "").slice(0, 1000),
+                    color: String((data.logoTag && data.logoTag.color) || "#81a3d6").slice(0, 20)
+                },
                 editToken: editToken,
+                discordId: sessionUser.discordId,
+                discordUser: {
+                    username: sessionUser.username,
+                    displayName: sessionUser.displayName,
+                    avatar: sessionUser.avatar
+                },
                 updated: Date.now()
             };
             persistProfiles();
