@@ -154,7 +154,7 @@ const server = http.createServer((req, res) => {
     } else {
         res.setHeader("Access-Control-Allow-Origin", "*");
     }
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, PATCH, DELETE");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key, X-Admin-Password, Cookie");
 
     if (req.method === "OPTIONS") {
