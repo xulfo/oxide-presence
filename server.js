@@ -397,14 +397,27 @@ const server = http.createServer((req, res) => {
         return sendJson(200, { ok: true, profiles: list });
     }
 
-    // PATCH /admin/api/profiles/:handle — award/update a custom profile logo tag
+    // PATCH /admin/api/profiles/:handle — update any profile field (admin override)
     if (req.method === "PATCH" && pathname.startsWith("/admin/api/profiles/")) {
         if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
         const handle = decodeURIComponent(pathname.replace("/admin/api/profiles/", "")).toLowerCase();
         if (!profiles[handle]) return sendJson(404, { error: "profile not found" });
         return readJson(data => {
             const p = profiles[handle];
+            if (data.name !== undefined) p.name = String(data.name || handle).slice(0, 32);
             if (data.status !== undefined) p.status = normalizeStatus(data.status);
+            if (data.bio !== undefined) p.bio = String(data.bio || "").slice(0, 500);
+            if (data.avatar !== undefined) p.avatar = String(data.avatar || "").slice(0, 1000);
+            if (data.background !== undefined) p.background = String(data.background || "").slice(0, 1000);
+            if (data.tags !== undefined) p.tags = String(data.tags || "").slice(0, 200);
+            if (data.music !== undefined) p.music = String(data.music || "").slice(0, 1000);
+            if (data.links !== undefined) {
+                p.links = Array.isArray(data.links)
+                    ? data.links.slice(0, 8)
+                        .map(l => ({ label: String((l && l.label) || "").slice(0, 30), url: String((l && l.url) || "").slice(0, 1000) }))
+                        .filter(l => l.url)
+                    : [];
+            }
             if (data.logoTag !== undefined) {
                 p.logoTag = {
                     text: String(data.logoTag.text || "").slice(0, 28),
@@ -416,6 +429,16 @@ const server = http.createServer((req, res) => {
             persistProfiles();
             return sendJson(200, { ok: true, handle, logoTag: p.logoTag, status: p.status });
         });
+    }
+
+    // DELETE /admin/api/profiles/:handle — remove a profile entirely
+    if (req.method === "DELETE" && pathname.startsWith("/admin/api/profiles/")) {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const handle = decodeURIComponent(pathname.replace("/admin/api/profiles/", "")).toLowerCase();
+        if (!profiles[handle]) return sendJson(404, { error: "profile not found" });
+        delete profiles[handle];
+        persistProfiles();
+        return sendJson(200, { ok: true, deleted: handle });
     }
 
     // POST /profile — create or update a user profile (short link page, Discord login required)
