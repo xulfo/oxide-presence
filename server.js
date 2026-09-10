@@ -1,6 +1,8 @@
 const http = require("http");
+const https = require("https");
 
 const activeClients = {}; // userId -> clientInfo
+const rbxCache = {};      // roblox proxy key -> { ts, data } (10 min TTL)
 const pendingKicks = {};  // userId -> boolean
 let totalExecutions = 4788406;
 
@@ -273,6 +275,49 @@ const server = http.createServer((req, res) => {
         const uniqueNames = new Set(Object.values(GAME_NAMES));
         uniqueNames.add("Universal");
         return sendJson(200, { ok: true, service: "oxide-hub", supported_games: uniqueNames.size });
+    }
+
+    // Roblox API proxy (Roblox sends no CORS headers, so browsers can't call it directly)
+    const proxyRoblox = (url, key, mapFn) => {
+        const hit = rbxCache[key];
+        if (hit && Date.now() - hit.ts < 10 * 60 * 1000) return sendJson(200, hit.data);
+        https.get(url, r => {
+            let d = "";
+            r.on("data", c => d += c);
+            r.on("end", () => {
+                try {
+                    const out = mapFn(r.statusCode, JSON.parse(d));
+                    if (!out) return sendJson(404, { error: "roblox data not available" });
+                    rbxCache[key] = { ts: Date.now(), data: out };
+                    sendJson(200, out);
+                } catch (e) {
+                    sendJson(502, { error: "bad response from roblox" });
+                }
+            });
+        }).on("error", () => sendJson(502, { error: "roblox unreachable" }));
+    };
+
+    // GET /roblox/user/:userId — user identity (display name + username)
+    if (req.method === "GET" && pathname.startsWith("/roblox/user/")) {
+        const userId = decodeURIComponent(pathname.replace("/roblox/user/", "")).replace(/[^0-9]/g, "");
+        if (!userId) return sendJson(400, { error: "missing userId" });
+        return proxyRoblox("https://users.roblox.com/v1/users/" + userId, "u:" + userId,
+            (status, j) => (status === 200 && j.id)
+                ? { ok: true, id: j.id, name: j.name, displayName: j.displayName }
+                : null);
+    }
+
+    // GET /roblox/avatar/:userId — full-body avatar thumbnail URL
+    if (req.method === "GET" && pathname.startsWith("/roblox/avatar/")) {
+        const userId = decodeURIComponent(pathname.replace("/roblox/avatar/", "")).replace(/[^0-9]/g, "");
+        if (!userId) return sendJson(400, { error: "missing userId" });
+        return proxyRoblox("https://thumbnails.roblox.com/v1/users/avatar?userIds=" + userId + "&size=420x420&format=Png&isCircular=false", "a:" + userId,
+            (status, j) => {
+                const item = j.data && j.data[0];
+                return (status === 200 && item && item.state === "Completed" && item.imageUrl)
+                    ? { ok: true, imageUrl: item.imageUrl }
+                    : null;
+            });
     }
 
     // POST /media — upload an MP3 (raw body) for profile background music
