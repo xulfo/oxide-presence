@@ -223,6 +223,480 @@ function getAliveClients() {
 loadProfilesFromGitHub();
 loadMediaFromGitHub();
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   OXIDE SHOP — buy Robux with crypto
+   ───────────────────────────────────────────────────────────────────────────
+   Flow: the buyer picks a pack (or types a custom amount), the backend locks a
+   USD price, converts it with a live rate and derives a UNIQUE on-chain amount
+   (base + a small untagged-free "tag"), then a watcher polls the matching chain
+   until a transaction to the deposit address carries that exact amount. That is
+   what makes payment detection automatic and unambiguous: several pending orders
+   always have different amounts, and every claimed txid is remembered so one
+   payment can never settle two orders.
+
+   Coins are pure adapters over public APIs (no npm dependencies):
+     btc / ltc  → mempool.space / litecoinspace.org REST
+     eth        → JSON-RPC block scan
+     sol        → Solana JSON-RPC (getSignaturesForAddress + getTransaction)
+     usdt       → TronGrid TRC-20 transfers
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const SHOP_MIN_ROBUX = 10000;
+const SHOP_MAX_ROBUX = 10000000;
+const SHOP_ORDER_TTL = 30 * 60 * 1000;      // price is locked for 30 minutes
+const SHOP_WATCH_TTL = 3 * 60 * 60 * 1000;  // ...but a late payment is still caught for 3h
+
+// Limited packs. `limit` is the lifetime stock shown on the storefront.
+const SHOP_PACKS = [
+    { id: "starter", label: "Starter",   robux: 100000, usdCents: 5000,  limit: 50, blurb: "The everyday top-up" },
+    { id: "plus",    label: "Plus",      robux: 150000, usdCents: 8000,  limit: 30, blurb: "Most popular" },
+    { id: "pro",     label: "Overlord",  robux: 300000, usdCents: 12000, limit: 20, blurb: "Best robux per dollar" }
+];
+
+// Custom orders: dollars per 1,000 robux, cheapest tier that the size qualifies for.
+const SHOP_TIERS = [
+    { minRobux: 300000, usdPer1k: 0.40 },
+    { minRobux: 150000, usdPer1k: 0.5334 },
+    { minRobux: 100000, usdPer1k: 0.50 },
+    { minRobux: SHOP_MIN_ROBUX, usdPer1k: 0.55 }
+];
+
+// Every coin matches on EXACT base units, so `step` drives how many concurrent
+// orders can share a coin before amounts repeat (tagMax) and how large the
+// rounding surcharge can get (always kept under ~$0.10).
+const SHOP_COINS = {
+    btc:  { name: "Bitcoin",   symbol: "BTC",  decimals: 8,  dp: 8, step: 1n,          tagMax: 99,    minConf: 1, scheme: "bitcoin",  explorer: "https://mempool.space/tx/" },
+    ltc:  { name: "Litecoin",  symbol: "LTC",  decimals: 8,  dp: 8, step: 1n,          tagMax: 99,    minConf: 1, scheme: "litecoin", explorer: "https://litecoinspace.org/tx/" },
+    eth:  { name: "Ethereum",  symbol: "ETH",  decimals: 18, dp: 9, step: 1000000000n, tagMax: 999,   minConf: 2, scheme: "ethereum", explorer: "https://etherscan.io/tx/" },
+    sol:  { name: "Solana",    symbol: "SOL",  decimals: 9,  dp: 9, step: 1n,          tagMax: 999,   minConf: 1, scheme: "solana",   explorer: "https://solscan.io/tx/" },
+    usdt: { name: "USDT (TRC-20)", symbol: "USDT", decimals: 6, dp: 6, step: 1n,       tagMax: 9999,  minConf: 1, scheme: "",         explorer: "https://tronscan.org/#/transaction/" }
+};
+
+const SHOP_COIN_IDS = { btc: "bitcoin", ltc: "litecoin", eth: "ethereum", sol: "solana", usdt: "tether" };
+const SHOP_FALLBACK_USD = { btc: 100000, eth: 3200, ltc: 105, sol: 150, usdt: 1 };
+
+const SHOP_MEMPOOL = { btc: "https://mempool.space", ltc: "https://litecoinspace.org" };
+const SHOP_ETH_RPC = process.env.SHOP_RPC_ETH || "https://ethereum-rpc.publicnode.com";
+const SHOP_SOL_RPC = process.env.SHOP_RPC_SOL || "https://api.mainnet-beta.solana.com";
+const SHOP_TRONGRID = "https://api.trongrid.io";
+const SHOP_TRON_USDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+
+const SHOP_DATA_PATH = "shop.json";
+
+// Runtime state. `config` is editable from the admin panel and persisted, so the
+// deposit addresses can be changed without a redeploy.
+const shopConfig = {
+    enabled: true,
+    announcement: "",
+    addresses: { btc: "", ltc: "", eth: "", sol: "", usdt: "" },
+    limits: SHOP_PACKS.reduce((acc, p) => (acc[p.id] = p.limit, acc), {})
+};
+const shopOrders = {};  // orderId -> order
+const shopTxIndex = {}; // txid -> orderId (a tx can only ever settle one order)
+const shopRates = { ts: 0, cents: {} };
+const shopIpLog = {};
+
+function shopHttpJson(url, opts) {
+    return new Promise((resolve, reject) => {
+        let u;
+        try { u = new URL(url); } catch (e) { return reject(new Error("bad url")); }
+        const body = (opts && opts.body) || null;
+        const req = https.request({
+            host: u.hostname,
+            path: u.pathname + u.search,
+            method: (opts && opts.method) || "GET",
+            headers: {
+                "User-Agent": "oxide-shop",
+                Accept: "application/json",
+                ...(body ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } : {}),
+                ...((opts && opts.headers) || {})
+            }
+        }, res => {
+            let d = "";
+            res.on("data", c => d += c);
+            res.on("end", () => {
+                if (res.statusCode >= 400) return reject(new Error("upstream " + res.statusCode));
+                try { resolve(JSON.parse(d)); } catch (e) { reject(new Error("bad json from " + u.hostname)); }
+            });
+        });
+        req.setTimeout(15000, () => req.destroy(new Error("timeout")));
+        req.on("error", reject);
+        if (body) req.write(body);
+        req.end();
+    });
+}
+
+// base units (BigInt) -> exact decimal string, e.g. 1234 sats -> "0.00001234"
+function shopFormatUnits(value, decimals, dp) {
+    const s = BigInt(value).toString().padStart(decimals + 1, "0");
+    const whole = s.slice(0, s.length - decimals);
+    let frac = s.slice(s.length - decimals);
+    if (dp < decimals) frac = frac.slice(0, dp);
+    frac = frac.replace(/0+$/, "");
+    return frac ? whole + "." + frac : whole;
+}
+
+function shopTierFor(robux) {
+    return SHOP_TIERS.find(t => robux >= t.minRobux) || SHOP_TIERS[SHOP_TIERS.length - 1];
+}
+
+function shopQuoteCustom(robux) {
+    const tier = shopTierFor(robux);
+    return { usdCents: Math.round((robux / 1000) * tier.usdPer1k * 100), tier };
+}
+
+async function shopRefreshRates(force) {
+    if (!force && Object.keys(shopRates.cents).length && Date.now() - shopRates.ts < 90000) return shopRates;
+    try {
+        const ids = Object.values(SHOP_COIN_IDS).join(",");
+        const j = await shopHttpJson("https://api.coingecko.com/api/v3/simple/price?ids=" + ids + "&vs_currencies=usd", { headers: { "User-Agent": "oxide-shop" } });
+        const cents = {};
+        for (const key of Object.keys(SHOP_COIN_IDS)) {
+            const p = j && j[SHOP_COIN_IDS[key]] && j[SHOP_COIN_IDS[key]].usd;
+            if (p && p > 0) cents[key] = Math.max(1, Math.round(p * 100));
+        }
+        if (Object.keys(cents).length) {
+            shopRates.ts = Date.now();
+            shopRates.cents = cents;
+            return shopRates;
+        }
+    } catch (e) { console.log("Shop rate fetch failed: " + e.message); }
+    if (!Object.keys(shopRates.cents).length) {
+        const cents = {};
+        for (const key of Object.keys(SHOP_COINS)) {
+            const env = Number(process.env["SHOP_RATE_" + key.toUpperCase()]);
+            const usd = env > 0 ? env : SHOP_FALLBACK_USD[key];
+            cents[key] = Math.max(1, Math.round(usd * 100));
+        }
+        shopRates.ts = Date.now();
+        shopRates.cents = cents;
+    }
+    return shopRates;
+}
+
+// usd (cents, integer) -> base units of `coin`, rounded up to the coin's step.
+// Integer BigInt math, so 18-decimal coins stay exact.
+function shopBaseAmount(usdCents, coinKey) {
+    const coin = SHOP_COINS[coinKey];
+    const rateCents = BigInt(shopRates.cents[coinKey] || Math.round(SHOP_FALLBACK_USD[coinKey] * 100));
+    const scale = 10n ** BigInt(coin.decimals);
+    let base = (BigInt(usdCents) * scale + rateCents - 1n) / rateCents;
+    base = ((base + coin.step - 1n) / coin.step) * coin.step;
+    return base;
+}
+
+function shopFreeTag(coinKey) {
+    const coin = SHOP_COINS[coinKey];
+    const used = new Set();
+    const now = Date.now();
+    for (const o of Object.values(shopOrders)) {
+        if (o.coin !== coinKey) continue;
+        if (o.status === "expired" || o.status === "cancelled") continue;
+        if (now - o.createdAt > SHOP_WATCH_TTL) continue;
+        used.add(o.tag);
+    }
+    for (let t = 1; t <= coin.tagMax; t++) if (!used.has(t)) return t;
+    return null;
+}
+
+function shopOrderRef() {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let out = "";
+    const bytes = crypto.randomBytes(6);
+    for (let i = 0; i < 6; i++) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+}
+
+function shopIp(req) {
+    const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    return fwd || req.socket.remoteAddress || "unknown";
+}
+
+// ── chain adapters ──────────────────────────────────────────────────────────
+
+async function shopIncomingMempool(coinKey, address) {
+    const base = SHOP_MEMPOOL[coinKey];
+    const [txs, tipRaw] = await Promise.all([
+        shopHttpJson(`${base}/api/address/${address}/txs`),
+        shopHttpJson(`${base}/api/blocks/tip/height`).catch(() => null)
+    ]);
+    const tip = typeof tipRaw === "number" ? tipRaw : (tipRaw && tipRaw.height) || 0;
+    const out = [];
+    for (const t of Array.isArray(txs) ? txs : []) {
+        let value = 0n;
+        for (const v of t.vout || []) if (v.scriptpubkey_address === address) value += BigInt(v.value || 0);
+        if (value <= 0n) continue;
+        const confirmed = !!(t.status && t.status.confirmed);
+        const confs = confirmed && tip ? Math.max(1, tip - (t.status.block_height || tip) + 1) : 0;
+        out.push({ txid: t.txid, value, confirmations: confs, ts: (t.status && t.status.block_time ? t.status.block_time * 1000 : Date.now()) });
+    }
+    return out;
+}
+
+async function shopRpc(url, method, params) {
+    const j = await shopHttpJson(url, { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params || [] }) });
+    if (j && j.error) throw new Error(j.error.message || "rpc error");
+    return j && j.result;
+}
+
+async function shopEthTip() {
+    return Number(BigInt(await shopRpc(SHOP_ETH_RPC, "eth_blockNumber")));
+}
+
+async function shopIncomingEth(address, fromBlock) {
+    const tip = await shopEthTip();
+    const start = Math.max(fromBlock || tip, tip - 300);
+    const lower = String(address).toLowerCase();
+    const out = [];
+    for (let n = start; n <= tip; n++) {
+        const blk = await shopRpc(SHOP_ETH_RPC, "eth_getBlockByNumber", ["0x" + n.toString(16), true]);
+        if (!blk || !blk.transactions) continue;
+        for (const tx of blk.transactions) {
+            if (!tx.to || String(tx.to).toLowerCase() !== lower) continue;
+            const value = BigInt(tx.value || "0x0");
+            if (value <= 0n) continue;
+            out.push({ txid: tx.hash, value, confirmations: tip - n + 1, ts: Number(BigInt(blk.timestamp || "0x0")) * 1000 });
+        }
+    }
+    return { incoming: out, tip };
+}
+
+async function shopIncomingSol(address) {
+    const sigs = await shopRpc(SHOP_SOL_RPC, "getSignaturesForAddress", [address, { limit: 12 }]);
+    const out = [];
+    for (const s of Array.isArray(sigs) ? sigs : []) {
+        if (!s || s.err) continue;
+        let tx = null;
+        try {
+            tx = await shopRpc(SHOP_SOL_RPC, "getTransaction", [s.signature, { encoding: "json", maxSupportedTransactionVersion: 0 }]);
+        } catch (_) { continue; }
+        if (!tx || !tx.meta) continue;
+        const keys = ((tx.transaction || {}).message || {}).accountKeys || [];
+        const idx = keys.findIndex(k => (typeof k === "string" ? k : k.pubkey) === address);
+        if (idx < 0) continue;
+        const delta = BigInt(tx.meta.postBalances[idx] || 0) - BigInt(tx.meta.preBalances[idx] || 0);
+        if (delta <= 0n) continue;
+        const confs = s.confirmationStatus === "finalized" ? 32 : (s.confirmationStatus === "confirmed" ? 1 : 0);
+        out.push({ txid: s.signature, value: delta, confirmations: confs, ts: (s.blockTime || 0) * 1000 || Date.now() });
+    }
+    return out;
+}
+
+async function shopIncomingTrc20(address) {
+    const j = await shopHttpJson(`${SHOP_TRONGRID}/v1/accounts/${address}/transactions/trc20?limit=50&only_confirmed=false&contract_address=${SHOP_TRON_USDT}`);
+    const out = [];
+    for (const t of (j && j.data) || []) {
+        if (!t || t.to !== address) continue;
+        const dec = (t.token_info && t.token_info.decimals) || 6;
+        if (dec !== 6) continue;
+        const value = BigInt(t.value || 0);
+        if (value <= 0n) continue;
+        const ts = t.block_timestamp || Date.now();
+        // TronGrid hides a confirmations field, so treat a transfer older than a
+        // minute as settled (TRON blocks are ~3s).
+        out.push({ txid: t.transaction_id, value, confirmations: Date.now() - ts > 60000 ? 20 : 0, ts });
+    }
+    return out;
+}
+
+// ── the matcher ─────────────────────────────────────────────────────────────
+
+async function shopCheckOrder(order) {
+    const coin = SHOP_COINS[order.coin];
+    if (!coin || ["paid", "delivered", "cancelled"].includes(order.status)) return order;
+    order.lastCheck = Date.now();
+
+    let incoming = [];
+    try {
+        if (order.coin === "btc" || order.coin === "ltc") incoming = await shopIncomingMempool(order.coin, order.address);
+        else if (order.coin === "eth") {
+            const tip = await shopEthTip();
+            const res = await shopIncomingEth(order.address, Math.max(order.scanFrom || tip, tip - 300));
+            order.scanFrom = res.tip + 1;
+            incoming = res.incoming;
+        } else if (order.coin === "sol") incoming = await shopIncomingSol(order.address);
+        else if (order.coin === "usdt") incoming = await shopIncomingTrc20(order.address);
+    } catch (e) {
+        order.lastError = e.message;
+        return order;
+    }
+    order.lastError = null;
+
+    // An already-matched payment only needs its confirmations refreshed.
+    if (order.txid) {
+        const mine = incoming.find(t => t.txid === order.txid);
+        if (mine) {
+            order.confirmations = mine.confirmations;
+            if (!["delivered", "cancelled"].includes(order.status)) {
+                if (mine.confirmations >= coin.minConf) order.status = order.underpaid ? "underpaid" : "paid";
+                else if (order.status === "awaiting_payment") order.status = "detected";
+            }
+            persistShop();
+        }
+        return order;
+    }
+
+    const amountBase = BigInt(order.amountBase);
+    const baseAmount = BigInt(order.baseAmount);
+    for (const tx of incoming) {
+        if (tx.ts && tx.ts < order.createdAt - 120000) continue;
+        if (shopTxIndex[tx.txid]) continue;
+        const v = tx.value;
+        const exact = v === amountBase;
+        const inBand = v >= baseAmount && v <= amountBase;
+        if (!exact && !inBand) {
+            if (order.status === "awaiting_payment" && v >= (baseAmount * 90n) / 100n && v < baseAmount) {
+                shopTxIndex[tx.txid] = order.id;
+                order.txid = tx.txid;
+                order.underpaid = true;
+                order.status = "underpaid";
+                order.received = shopFormatUnits(v, coin.decimals, coin.dp);
+                order.confirmations = tx.confirmations;
+                persistShop();
+                return order;
+            }
+            continue;
+        }
+        shopTxIndex[tx.txid] = order.id;
+        order.txid = tx.txid;
+        order.received = shopFormatUnits(v, coin.decimals, coin.dp);
+        order.confirmations = tx.confirmations;
+        order.status = tx.confirmations >= coin.minConf ? "paid" : "detected";
+        persistShop();
+        return order;
+    }
+    persistShop();
+    return order;
+}
+
+function shopPublicOrder(o) {
+    const coin = SHOP_COINS[o.coin] || {};
+    const amount = shopFormatUnits(o.amountBase, coin.decimals || 8, coin.dp || 8);
+    return {
+        id: o.id,
+        ref: o.ref,
+        status: o.status,
+        coin: o.coin,
+        coinName: coin.name || o.coin,
+        symbol: coin.symbol || "",
+        address: o.address,
+        amount,
+        paymentUri: coin.scheme ? `${coin.scheme}:${o.address}?amount=${amount}` : null,
+        usd: (o.usdCents / 100).toFixed(2),
+        robux: o.robux,
+        packId: o.packId,
+        createdAt: o.createdAt,
+        expiresAt: o.expiresAt,
+        secondsLeft: Math.max(0, Math.round((o.expiresAt - Date.now()) / 1000)),
+        txid: o.txid || null,
+        explorer: o.txid && coin.explorer ? coin.explorer + o.txid : null,
+        confirmations: o.confirmations || 0,
+        requiredConfirmations: coin.minConf || 1,
+        received: o.received || null,
+        underpaid: !!o.underpaid,
+        robloxUsername: o.robloxUsername,
+        discord: o.discord || null,
+        lastError: o.lastError || null
+    };
+}
+
+function shopPackStatus() {
+    const sold = {};
+    const counts = { paid: 0, delivered: 0, robuxDelivered: 0 };
+    for (const o of Object.values(shopOrders)) {
+        if (["paid", "delivered"].includes(o.status)) {
+            counts.paid++;
+            if (o.packId) sold[o.packId] = (sold[o.packId] || 0) + 1;
+            if (o.status === "delivered") { counts.delivered++; counts.robuxDelivered += o.robux || 0; }
+        }
+    }
+    return {
+        packs: SHOP_PACKS.map(p => {
+            const limit = shopConfig.limits[p.id] != null ? shopConfig.limits[p.id] : p.limit;
+            const used = sold[p.id] || 0;
+            return { ...p, limit, sold: used, remaining: Math.max(0, limit - used) };
+        }),
+        counts
+    };
+}
+
+// ── persistence (local file + GitHub mirror, same pattern as profiles) ──────
+
+let shopPersistTimer = null;
+function persistShop() {
+    const snapshot = JSON.stringify({ config: shopConfig, orders: shopOrders, txIndex: shopTxIndex });
+    try { fs.writeFileSync("./shop-data.json", snapshot); } catch (_) {}
+    if (shopPersistTimer) return;
+    shopPersistTimer = setTimeout(async () => {
+        shopPersistTimer = null;
+        try {
+            const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${SHOP_DATA_PATH}`);
+            const payload = { content: Buffer.from(snapshot, "utf8").toString("base64"), message: "shop update", branch: "main" };
+            if (res.status === 200) payload.sha = JSON.parse(res.body).sha;
+            const put = await ghApi("PUT", `/repos/${GH_DATA_REPO}/contents/${SHOP_DATA_PATH}`, payload);
+            if (put.status !== 200 && put.status !== 201) console.log("Shop save skipped (" + put.status + ")");
+        } catch (e) { console.log("Shop save failed: " + e.message); }
+    }, 2000);
+}
+
+async function loadShopFromGitHub() {
+    try {
+        const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${SHOP_DATA_PATH}`);
+        if (res.status === 200) {
+            const saved = JSON.parse(Buffer.from(JSON.parse(res.body).content, "base64").toString("utf8"));
+            if (saved.config) Object.assign(shopConfig, saved.config);
+            if (saved.config && saved.config.addresses) shopConfig.addresses = saved.config.addresses;
+            if (saved.orders) Object.assign(shopOrders, saved.orders);
+            if (saved.txIndex) Object.assign(shopTxIndex, saved.txIndex);
+            console.log("Loaded " + Object.keys(shopOrders).length + " shop orders from GitHub");
+        }
+    } catch (e) { console.log("Shop load failed: " + e.message); }
+    try {
+        if (fs.existsSync("./shop-data.json")) {
+            const saved = JSON.parse(fs.readFileSync("./shop-data.json", "utf8"));
+            if (saved.config && !Object.keys(shopOrders).length) Object.assign(shopConfig, saved.config);
+            if (saved.orders) Object.assign(shopOrders, saved.orders);
+            if (saved.txIndex) Object.assign(shopTxIndex, saved.txIndex);
+        }
+    } catch (_) {}
+}
+
+async function shopTick() {
+    const now = Date.now();
+    for (const o of Object.values(shopOrders)) {
+        if (["paid", "delivered", "cancelled"].includes(o.status)) continue;
+        if (now - o.createdAt > SHOP_WATCH_TTL) {
+            if (o.status !== "expired") { o.status = "expired"; persistShop(); }
+            continue;
+        }
+        if (now - (o.lastCheck || 0) < 12000) continue;
+        try { await shopCheckOrder(o); } catch (e) { o.lastError = e.message; }
+    }
+}
+
+function shopStart() {
+    loadShopFromGitHub().then(() => shopRefreshRates(true)).catch(() => {});
+    setInterval(() => { shopTick().catch(() => {}); }, 25000);
+    setInterval(() => { shopRefreshRates(false).catch(() => {}); }, 5 * 60 * 1000);
+}
+
+// ── address validation (loose per-chain shape checks) ──────────────────────
+
+function shopValidAddress(coinKey, value) {
+    const v = String(value || "").trim();
+    if (!v) return true; // empty = coin disabled
+    if (coinKey === "eth") return /^0x[0-9a-fA-F]{40}$/.test(v);
+    if (coinKey === "usdt") return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(v);
+    if (coinKey === "sol") return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
+    if (coinKey === "btc" || coinKey === "ltc") return /^[A-Za-z0-9]{26,62}$/.test(v);
+    return false;
+}
+
+// Boot the shop AFTER every constant above exists — loadShopFromGitHub() reads
+// SHOP_DATA_PATH, so calling this earlier throws a TDZ error and silently loses
+// all orders on redeploy.
+shopStart();
+
 const server = http.createServer((req, res) => {
     // Exact Origin reflection to satisfy browser CORS requirement with credentials: 'include'
     const origin = req.headers.origin;
@@ -908,6 +1382,224 @@ const server = http.createServer((req, res) => {
             sendJson(400, { error: "missing user_id" });
         });
         return;
+    }
+
+    /* ══ Oxide Shop — public storefront ══════════════════════════════════════ */
+
+    // GET /shop/packs — packs, tiers, coins and live rates
+    if (req.method === "GET" && pathname === "/shop/packs") {
+        shopRefreshRates(false).catch(() => {});
+        const st = shopPackStatus();
+        const rates = {};
+        for (const key of Object.keys(SHOP_COINS)) rates[key] = (shopRates.cents[key] || 0) / 100;
+        return sendJson(200, {
+            ok: true,
+            enabled: !!shopConfig.enabled,
+            announcement: shopConfig.announcement || "",
+            minRobux: SHOP_MIN_ROBUX,
+            maxRobux: SHOP_MAX_ROBUX,
+            packs: st.packs,
+            tiers: SHOP_TIERS,
+            rates,
+            coins: Object.keys(SHOP_COINS).map(key => ({
+                key,
+                name: SHOP_COINS[key].name,
+                symbol: SHOP_COINS[key].symbol,
+                dp: SHOP_COINS[key].dp,
+                minConf: SHOP_COINS[key].minConf,
+                available: !!shopConfig.addresses[key]
+            })),
+            stats: { paid: st.counts.paid, delivered: st.counts.delivered, robuxDelivered: st.counts.robuxDelivered }
+        });
+    }
+
+    // POST /shop/quote — authoritative price for a custom amount
+    if (req.method === "POST" && pathname === "/shop/quote") {
+        return readJson(body => {
+            const robux = Math.floor(Number(body.robux) || 0);
+            if (robux < SHOP_MIN_ROBUX) return sendJson(400, { error: `Minimum order is ${SHOP_MIN_ROBUX.toLocaleString("en-US")} Robux` });
+            if (robux > SHOP_MAX_ROBUX) return sendJson(400, { error: "Order too large — contact us on Discord" });
+            const q = shopQuoteCustom(robux);
+            sendJson(200, { ok: true, robux, usd: (q.usdCents / 100).toFixed(2), usdCents: q.usdCents, usdPer1k: q.tier.usdPer1k });
+        });
+    }
+
+    // POST /shop/order — lock the price and derive a unique on-chain amount
+    if (req.method === "POST" && pathname === "/shop/order") {
+        return readJson(async body => {
+            try {
+                if (!shopConfig.enabled) return sendJson(503, { error: "The shop is temporarily closed" });
+
+                const ip = shopIp(req);
+                const now = Date.now();
+                shopIpLog[ip] = (shopIpLog[ip] || []).filter(t => now - t < 15 * 60 * 1000);
+                if (shopIpLog[ip].length >= 12) return sendJson(429, { error: "Too many orders from your connection — try again in a few minutes" });
+
+                const coinKey = String(body.coin || "").toLowerCase();
+                if (!SHOP_COINS[coinKey]) return sendJson(400, { error: "Unsupported coin" });
+                const address = shopConfig.addresses[coinKey];
+                if (!address) return sendJson(400, { error: SHOP_COINS[coinKey].name + " is not available right now" });
+
+                const robloxUsername = String(body.robloxUsername || "").trim().slice(0, 20);
+                if (!/^[A-Za-z0-9_]{3,20}$/.test(robloxUsername)) return sendJson(400, { error: "Enter the Roblox username that should receive the Robux" });
+                const discord = String(body.discord || "").trim().slice(0, 64);
+
+                let robux, usdCents, packId = null;
+                if (body.pack) {
+                    const pack = shopPackStatus().packs.find(p => p.id === String(body.pack));
+                    if (!pack) return sendJson(400, { error: "Unknown pack" });
+                    if (pack.remaining <= 0) return sendJson(409, { error: pack.label + " is sold out" });
+                    robux = pack.robux;
+                    usdCents = pack.usdCents;
+                    packId = pack.id;
+                } else {
+                    robux = Math.floor(Number(body.robux) || 0);
+                    if (robux < SHOP_MIN_ROBUX) return sendJson(400, { error: `Minimum order is ${SHOP_MIN_ROBUX.toLocaleString("en-US")} Robux` });
+                    if (robux > SHOP_MAX_ROBUX) return sendJson(400, { error: "Order too large — contact us on Discord" });
+                    usdCents = shopQuoteCustom(robux).usdCents;
+                }
+
+                await shopRefreshRates(false);
+                const tag = shopFreeTag(coinKey);
+                if (tag == null) return sendJson(429, { error: SHOP_COINS[coinKey].name + " is busy right now — pick another coin or retry in a few minutes" });
+
+                const coin = SHOP_COINS[coinKey];
+                const base = shopBaseAmount(usdCents, coinKey);
+                const amountBase = base + BigInt(tag) * coin.step;
+
+                const id = "ox_" + crypto.randomBytes(6).toString("hex");
+                const order = {
+                    id,
+                    ref: shopOrderRef(),
+                    coin: coinKey,
+                    address,
+                    tag,
+                    baseAmount: base.toString(),
+                    amountBase: amountBase.toString(),
+                    usdCents,
+                    robux,
+                    packId,
+                    robloxUsername,
+                    discord,
+                    status: "awaiting_payment",
+                    createdAt: now,
+                    expiresAt: now + SHOP_ORDER_TTL,
+                    rateUsdCents: shopRates.cents[coinKey] || 0,
+                    confirmations: 0,
+                    txid: null,
+                    scanFrom: null,
+                    lastCheck: 0,
+                    lastError: null,
+                    ip
+                };
+                shopOrders[id] = order;
+                shopIpLog[ip].push(now);
+                persistShop();
+                sendJson(200, { ok: true, order: shopPublicOrder(order) });
+            } catch (e) {
+                console.log("Shop order failed: " + e.message);
+                sendJson(500, { error: "Could not create the order — try again" });
+            }
+        });
+    }
+
+    // GET /shop/order/:id (or :ref) — live payment status + a forced chain re-check
+    if (req.method === "GET" && /^\/shop\/order\/[A-Za-z0-9_-]+$/.test(pathname)) {
+        const key = pathname.replace("/shop/order/", "");
+        const order = shopOrders[key] || Object.values(shopOrders).find(o => o.ref === key.toUpperCase());
+        if (!order) return sendJson(404, { error: "Order not found" });
+        const reply = () => sendJson(200, { ok: true, order: shopPublicOrder(order) });
+        if (Date.now() - (order.lastCheck || 0) > 8000) {
+            return shopCheckOrder(order).then(reply).catch(reply);
+        }
+        return reply();
+    }
+
+    // POST /shop/order/:id/check — the "I already sent it" button
+    if (req.method === "POST" && pathname.startsWith("/shop/order/") && pathname.endsWith("/check")) {
+        const id = pathname.slice("/shop/order/".length, -"check".length - 1);
+        const order = shopOrders[id];
+        if (!order) return sendJson(404, { error: "Order not found" });
+        return shopCheckOrder(order)
+            .then(() => sendJson(200, { ok: true, order: shopPublicOrder(order) }))
+            .catch(e => sendJson(502, { error: "Could not reach the blockchain explorer: " + e.message }));
+    }
+
+    /* ══ Oxide Shop — admin ══════════════════════════════════════════════════ */
+
+    // GET /admin/api/shop — orders, config, rates
+    if (req.method === "GET" && pathname === "/admin/api/shop") {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const orders = Object.values(shopOrders)
+            .sort((a, b) => b.createdAt - a.createdAt)
+            .slice(0, 400)
+            .map(o => ({ ...shopPublicOrder(o), tag: o.tag, ip: o.ip || null, updatedAt: o.updatedAt || null }));
+        return sendJson(200, {
+            ok: true,
+            orders,
+            config: shopConfig,
+            rates: shopRates.cents,
+            rateAge: Date.now() - shopRates.ts,
+            packs: shopPackStatus().packs,
+            coins: Object.keys(SHOP_COINS).map(key => ({ key, name: SHOP_COINS[key].name, symbol: SHOP_COINS[key].symbol }))
+        });
+    }
+
+    // POST /admin/api/shop/orders/:id/check — re-check a late payment by hand
+    if (req.method === "POST" && pathname.startsWith("/admin/api/shop/orders/") && pathname.endsWith("/check")) {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const id = decodeURIComponent(pathname.slice("/admin/api/shop/orders/".length, -"check".length - 1));
+        const order = shopOrders[id];
+        if (!order) return sendJson(404, { error: "Order not found" });
+        return shopCheckOrder(order)
+            .then(() => sendJson(200, { ok: true, order: shopPublicOrder(order) }))
+            .catch(e => sendJson(502, { error: "Chain lookup failed: " + e.message }));
+    }
+
+    // PATCH /admin/api/shop/orders/:id — mark delivered / cancel / reopen
+    if (req.method === "PATCH" && pathname.startsWith("/admin/api/shop/orders/")) {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const id = decodeURIComponent(pathname.replace("/admin/api/shop/orders/", ""));
+        const order = shopOrders[id];
+        if (!order) return sendJson(404, { error: "Order not found" });
+        return readJson(body => {
+            const status = String(body.status || "");
+            if (!["paid", "delivered", "cancelled", "awaiting_payment"].includes(status)) return sendJson(400, { error: "Unsupported status" });
+            if (body.txid) order.txid = String(body.txid).slice(0, 120);
+            order.status = status;
+            order.updatedAt = Date.now();
+            persistShop();
+            sendJson(200, { ok: true, order: shopPublicOrder(order) });
+        });
+    }
+
+    // PATCH /admin/api/shop/config — deposit addresses, pack stock, open/closed
+    if (req.method === "PATCH" && pathname === "/admin/api/shop/config") {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        return readJson(body => {
+            const errors = [];
+            if (body.addresses && typeof body.addresses === "object") {
+                for (const key of Object.keys(SHOP_COINS)) {
+                    if (body.addresses[key] == null) continue;
+                    const value = String(body.addresses[key]).trim();
+                    if (!shopValidAddress(key, value)) {
+                        errors.push("Invalid " + SHOP_COINS[key].name + " address");
+                        continue;
+                    }
+                    shopConfig.addresses[key] = value;
+                }
+            }
+            if (body.limits && typeof body.limits === "object") {
+                for (const key of Object.keys(body.limits)) {
+                    const n = Math.floor(Number(body.limits[key]));
+                    if (n >= 0 && n <= 100000) shopConfig.limits[key] = n;
+                }
+            }
+            if (body.enabled != null) shopConfig.enabled = !!body.enabled;
+            if (body.announcement != null) shopConfig.announcement = String(body.announcement).slice(0, 240);
+            persistShop();
+            sendJson(200, { ok: true, config: shopConfig, errors });
+        });
     }
 
     res.writeHead(404, { "Content-Type": "text/plain" });
