@@ -253,33 +253,27 @@ const SHOP_PACKS = [
     { id: "pro",     label: "Overlord",  robux: 300000, usdCents: 12000, limit: 20, blurb: "Best robux per dollar" }
 ];
 
-// Custom orders: dollars per 1,000 robux, cheapest tier that the size qualifies for.
+// Custom orders: a flat $1.00 per 1,000 Robux, so 10,000 Robux = $10 and
+// 12,000 = $12. The limited packs stay cheaper per 1,000 — that is what makes
+// them worth buying.
 const SHOP_TIERS = [
-    { minRobux: 300000, usdPer1k: 0.40 },
-    { minRobux: 150000, usdPer1k: 0.5334 },
-    { minRobux: 100000, usdPer1k: 0.50 },
-    { minRobux: SHOP_MIN_ROBUX, usdPer1k: 0.55 }
+    { minRobux: SHOP_MIN_ROBUX, usdPer1k: 1.0 }
 ];
 
 // Every coin matches on EXACT base units, so `step` drives how many concurrent
 // orders can share a coin before amounts repeat (tagMax) and how large the
 // rounding surcharge can get (always kept under ~$0.10).
 const SHOP_COINS = {
-    btc:  { name: "Bitcoin",   symbol: "BTC",  decimals: 8,  dp: 8, step: 1n,          tagMax: 99,    minConf: 1, scheme: "bitcoin",  explorer: "https://mempool.space/tx/" },
-    ltc:  { name: "Litecoin",  symbol: "LTC",  decimals: 8,  dp: 8, step: 1n,          tagMax: 99,    minConf: 1, scheme: "litecoin", explorer: "https://litecoinspace.org/tx/" },
-    eth:  { name: "Ethereum",  symbol: "ETH",  decimals: 18, dp: 9, step: 1000000000n, tagMax: 999,   minConf: 2, scheme: "ethereum", explorer: "https://etherscan.io/tx/" },
-    sol:  { name: "Solana",    symbol: "SOL",  decimals: 9,  dp: 9, step: 1n,          tagMax: 999,   minConf: 1, scheme: "solana",   explorer: "https://solscan.io/tx/" },
-    usdt: { name: "USDT (TRC-20)", symbol: "USDT", decimals: 6, dp: 6, step: 1n,       tagMax: 9999,  minConf: 1, scheme: "",         explorer: "https://tronscan.org/#/transaction/" }
+    btc: { name: "Bitcoin",  symbol: "BTC", decimals: 8,  dp: 8, step: 1n,          tagMax: 99,  minConf: 1, scheme: "bitcoin",  explorer: "https://mempool.space/tx/" },
+    ltc: { name: "Litecoin", symbol: "LTC", decimals: 8,  dp: 8, step: 1n,          tagMax: 99,  minConf: 1, scheme: "litecoin", explorer: "https://litecoinspace.org/tx/" },
+    eth: { name: "Ethereum", symbol: "ETH", decimals: 18, dp: 9, step: 1000000000n, tagMax: 999, minConf: 2, scheme: "ethereum", explorer: "https://etherscan.io/tx/" }
 };
 
-const SHOP_COIN_IDS = { btc: "bitcoin", ltc: "litecoin", eth: "ethereum", sol: "solana", usdt: "tether" };
-const SHOP_FALLBACK_USD = { btc: 100000, eth: 3200, ltc: 105, sol: 150, usdt: 1 };
+const SHOP_COIN_IDS = { btc: "bitcoin", ltc: "litecoin", eth: "ethereum" };
+const SHOP_FALLBACK_USD = { btc: 100000, eth: 3200, ltc: 105 };
 
 const SHOP_MEMPOOL = { btc: "https://mempool.space", ltc: "https://litecoinspace.org" };
 const SHOP_ETH_RPC = process.env.SHOP_RPC_ETH || "https://ethereum-rpc.publicnode.com";
-const SHOP_SOL_RPC = process.env.SHOP_RPC_SOL || "https://api.mainnet-beta.solana.com";
-const SHOP_TRONGRID = "https://api.trongrid.io";
-const SHOP_TRON_USDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 
 const SHOP_DATA_PATH = "shop.json";
 
@@ -288,7 +282,7 @@ const SHOP_DATA_PATH = "shop.json";
 const shopConfig = {
     enabled: true,
     announcement: "",
-    addresses: { btc: "", ltc: "", eth: "", sol: "", usdt: "" },
+    addresses: { btc: "", ltc: "", eth: "" },
     limits: SHOP_PACKS.reduce((acc, p) => (acc[p.id] = p.limit, acc), {})
 };
 const shopOrders = {};  // orderId -> order
@@ -461,44 +455,6 @@ async function shopIncomingEth(address, fromBlock) {
     return { incoming: out, tip };
 }
 
-async function shopIncomingSol(address) {
-    const sigs = await shopRpc(SHOP_SOL_RPC, "getSignaturesForAddress", [address, { limit: 12 }]);
-    const out = [];
-    for (const s of Array.isArray(sigs) ? sigs : []) {
-        if (!s || s.err) continue;
-        let tx = null;
-        try {
-            tx = await shopRpc(SHOP_SOL_RPC, "getTransaction", [s.signature, { encoding: "json", maxSupportedTransactionVersion: 0 }]);
-        } catch (_) { continue; }
-        if (!tx || !tx.meta) continue;
-        const keys = ((tx.transaction || {}).message || {}).accountKeys || [];
-        const idx = keys.findIndex(k => (typeof k === "string" ? k : k.pubkey) === address);
-        if (idx < 0) continue;
-        const delta = BigInt(tx.meta.postBalances[idx] || 0) - BigInt(tx.meta.preBalances[idx] || 0);
-        if (delta <= 0n) continue;
-        const confs = s.confirmationStatus === "finalized" ? 32 : (s.confirmationStatus === "confirmed" ? 1 : 0);
-        out.push({ txid: s.signature, value: delta, confirmations: confs, ts: (s.blockTime || 0) * 1000 || Date.now() });
-    }
-    return out;
-}
-
-async function shopIncomingTrc20(address) {
-    const j = await shopHttpJson(`${SHOP_TRONGRID}/v1/accounts/${address}/transactions/trc20?limit=50&only_confirmed=false&contract_address=${SHOP_TRON_USDT}`);
-    const out = [];
-    for (const t of (j && j.data) || []) {
-        if (!t || t.to !== address) continue;
-        const dec = (t.token_info && t.token_info.decimals) || 6;
-        if (dec !== 6) continue;
-        const value = BigInt(t.value || 0);
-        if (value <= 0n) continue;
-        const ts = t.block_timestamp || Date.now();
-        // TronGrid hides a confirmations field, so treat a transfer older than a
-        // minute as settled (TRON blocks are ~3s).
-        out.push({ txid: t.transaction_id, value, confirmations: Date.now() - ts > 60000 ? 20 : 0, ts });
-    }
-    return out;
-}
-
 // ── the matcher ─────────────────────────────────────────────────────────────
 
 async function shopCheckOrder(order) {
@@ -514,8 +470,7 @@ async function shopCheckOrder(order) {
             const res = await shopIncomingEth(order.address, Math.max(order.scanFrom || tip, tip - 300));
             order.scanFrom = res.tip + 1;
             incoming = res.incoming;
-        } else if (order.coin === "sol") incoming = await shopIncomingSol(order.address);
-        else if (order.coin === "usdt") incoming = await shopIncomingTrc20(order.address);
+        }
     } catch (e) {
         order.lastError = e.message;
         return order;
@@ -646,6 +601,10 @@ async function loadShopFromGitHub() {
             const saved = JSON.parse(Buffer.from(JSON.parse(res.body).content, "base64").toString("utf8"));
             if (saved.config) Object.assign(shopConfig, saved.config);
             if (saved.config && saved.config.addresses) shopConfig.addresses = saved.config.addresses;
+            // Drop keys for coins that no longer exist (an older config could still
+            // carry sol/usdt addresses) and make sure every live coin has a slot.
+            for (const key of Object.keys(shopConfig.addresses)) if (!SHOP_COINS[key]) delete shopConfig.addresses[key];
+            for (const key of Object.keys(SHOP_COINS)) if (shopConfig.addresses[key] == null) shopConfig.addresses[key] = "";
             if (saved.orders) Object.assign(shopOrders, saved.orders);
             if (saved.txIndex) Object.assign(shopTxIndex, saved.txIndex);
             console.log("Loaded " + Object.keys(shopOrders).length + " shop orders from GitHub");
@@ -654,7 +613,12 @@ async function loadShopFromGitHub() {
     try {
         if (fs.existsSync("./shop-data.json")) {
             const saved = JSON.parse(fs.readFileSync("./shop-data.json", "utf8"));
-            if (saved.config && !Object.keys(shopOrders).length) Object.assign(shopConfig, saved.config);
+            if (saved.config && !Object.keys(shopOrders).length) {
+                Object.assign(shopConfig, saved.config);
+                if (saved.config.addresses) shopConfig.addresses = saved.config.addresses;
+                for (const key of Object.keys(shopConfig.addresses)) if (!SHOP_COINS[key]) delete shopConfig.addresses[key];
+                for (const key of Object.keys(SHOP_COINS)) if (shopConfig.addresses[key] == null) shopConfig.addresses[key] = "";
+            }
             if (saved.orders) Object.assign(shopOrders, saved.orders);
             if (saved.txIndex) Object.assign(shopTxIndex, saved.txIndex);
         }
@@ -686,8 +650,6 @@ function shopValidAddress(coinKey, value) {
     const v = String(value || "").trim();
     if (!v) return true; // empty = coin disabled
     if (coinKey === "eth") return /^0x[0-9a-fA-F]{40}$/.test(v);
-    if (coinKey === "usdt") return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(v);
-    if (coinKey === "sol") return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
     if (coinKey === "btc" || coinKey === "ltc") return /^[A-Za-z0-9]{26,62}$/.test(v);
     return false;
 }
