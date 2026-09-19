@@ -186,6 +186,71 @@ const UNIVERSE_IDS = {
     17625359962: 6035872082
 };
 
+// Games the hub has executed that nobody has named yet. A client only reports a
+// placeId, so an unknown one is resolved against Roblox once and then becomes a
+// first-class supported game (live + execution stats + the website list).
+const placeNameCache = {};   // placeId -> resolved game name
+const placeNamePending = {}; // placeId -> lookup in flight
+
+function shopGuessName(placeId) {
+    return GAME_NAMES[placeId] || placeNameCache[placeId] || null;
+}
+
+function resolvePlaceName(placeId) {
+    if (!placeId || shopGuessName(placeId) || placeNamePending[placeId]) return;
+    placeNamePending[placeId] = true;
+    const https = require("https");
+    const done = () => { delete placeNamePending[placeId]; };
+    https.get({ host: "apis.roblox.com", path: `/universes/v1/places/${placeId}/universe`, headers: { "User-Agent": "oxide-hub" } }, r => {
+        let d = "";
+        r.on("data", c => d += c);
+        r.on("end", () => {
+            let universeId = 0;
+            try { universeId = Number((JSON.parse(d) || {}).universeId) || 0; } catch (_) {}
+            if (!universeId) return done();
+            https.get({ host: "games.roblox.com", path: `/v1/games?universeIds=${universeId}`, headers: { "User-Agent": "oxide-hub" } }, r2 => {
+                let d2 = "";
+                r2.on("data", c => d2 += c);
+                r2.on("end", () => {
+                    try {
+                        const g = ((JSON.parse(d2) || {}).data || [])[0];
+                        if (g && g.name) {
+                            placeNameCache[placeId] = String(g.name);
+                            GAME_NAMES[placeId] = String(g.name);
+                            UNIVERSE_IDS[placeId] = universeId;
+                            console.log(`Auto-registered game "${g.name}" (place ${placeId})`);
+                        }
+                    } catch (_) {}
+                    done();
+                });
+            }).on("error", done);
+        });
+    }).on("error", done);
+}
+
+// The single source of truth for "which games are supported". Baseline numbers, real
+// launch counters and auto-discovered games are merged here, so /games, /stats and the
+// control room can never disagree about the list or the count.
+function allTrackedGames() {
+    const byName = new Map();
+    const ensure = (name, placeId) => {
+        const key = String(name).toLowerCase();
+        let e = byName.get(key);
+        if (!e) {
+            e = { name: String(name), place_id: placeId || 0, universe_id: 0, launches: 0 };
+            byName.set(key, e);
+        } else if (!e.place_id && placeId) {
+            e.place_id = placeId;
+        }
+        return e;
+    };
+    for (const g of BASELINE_GAMES) ensure(g.name, g.place_id).launches += g.launches;
+    for (const pid of Object.keys(GAME_NAMES)) ensure(GAME_NAMES[pid], Number(pid));
+    for (const [name, launches] of Object.entries(gameLaunches)) ensure(name, 0).launches += launches;
+    for (const e of byName.values()) e.universe_id = UNIVERSE_IDS[e.place_id] || 0;
+    return Array.from(byName.values()).sort((a, b) => b.launches - a.launches);
+}
+
 const avatarCache = {};
 
 async function resolveAvatars(clients) {
@@ -1269,9 +1334,10 @@ const server = http.createServer((req, res) => {
                 join_url: jobId ? `roblox://experiences/start?placeId=${placeId}&gameInstanceId=${jobId}` : ""
             };
 
-            const gName = GAME_NAMES[placeId] || "Unsupported";
+            const gName = shopGuessName(placeId) || "Unsupported";
             if (gName === "Unsupported") {
                 unsupportedLaunches += 1;
+                resolvePlaceName(placeId); // learn the game so it is tracked from now on
             } else {
                 gameLaunches[gName] = (gameLaunches[gName] || 0) + 1;
             }
@@ -1321,7 +1387,9 @@ const server = http.createServer((req, res) => {
         const execMap = {};
 
         for (const c of alive) {
-            const gName = GAME_NAMES[c.placeId] || "Unsupported";
+            const known = shopGuessName(c.placeId);
+            if (!known) resolvePlaceName(c.placeId);
+            const gName = known || "Unsupported";
             gameMap[gName] = (gameMap[gName] || 0) + 1;
             const exec = c.executor || "Unknown";
             execMap[exec] = (execMap[exec] || 0) + 1;
@@ -1356,14 +1424,8 @@ const server = http.createServer((req, res) => {
         const start = new Date(now.getTime() - 30 * 86400000);
 
         // Baseline + real launches from /register, so every supported game
-        // (including new ones) shows up with live execution counts.
-        const games = BASELINE_GAMES
-            .map(g => ({
-                name: g.name,
-                launches: g.launches + (gameLaunches[g.name] || 0),
-                place_id: g.place_id
-            }))
-            .sort((a, b) => b.launches - a.launches);
+        // (including ones discovered at runtime) shows up with live execution counts.
+        const games = allTrackedGames().map(g => ({ name: g.name, launches: g.launches, place_id: g.place_id }));
 
         return sendJson(200, {
             ok: true,
@@ -1408,16 +1470,29 @@ const server = http.createServer((req, res) => {
         });
     }
 
+    // GET /games — the canonical supported-game list.
+    // The website merges this with its built-in list, so a game only has to be known
+    // here to appear on the site: newly tracked games (seen in gameLaunches, GAME_NAMES
+    // or a hub registration) show up without any client change.
+    if (req.method === "GET" && pathname === "/games") {
+        const games = allTrackedGames();
+        return sendJson(200, { ok: true, count: games.length, games: games });
+    }
+
     // GET /banner/:name — real game card banner (redirects to the Roblox thumbnail).
     // The website falls back to ${API_BASE}/banner/<name>.webp for any game that
     // has no hardcoded banner, so every supported game gets a real thumbnail.
     if (req.method === "GET" && pathname.startsWith("/banner/")) {
         const gName = decodeURIComponent(pathname.replace("/banner/", "").replace(/\.webp$/i, ""));
         const matched = BASELINE_GAMES.find(g => g.name.toLowerCase() === gName.toLowerCase());
-        if (!matched || !UNIVERSE_IDS[matched.place_id]) {
+        // Fall back to any known place id carrying that name, so games added to the
+        // tracker (but not to the baseline) still resolve to a real thumbnail.
+        const dynamicPlaceId = matched ? matched.place_id
+            : Number(Object.keys(GAME_NAMES).find(pid => String(GAME_NAMES[pid]).toLowerCase() === gName.toLowerCase())) || 0;
+        if (!dynamicPlaceId || !UNIVERSE_IDS[dynamicPlaceId]) {
             return sendJson(404, { error: "unknown game" });
         }
-        const universeId = UNIVERSE_IDS[matched.place_id];
+        const universeId = UNIVERSE_IDS[dynamicPlaceId];
         const https = require("https");
         const apiPath = `/v1/games/multiget/thumbnails?universeIds=${universeId}&countPerUniverse=1&defaults=true&size=768x432&format=Png&isCircular=false`;
         https.get({ host: "thumbnails.roblox.com", path: apiPath, headers: { "User-Agent": "oxide-hub" } }, r2 => {
