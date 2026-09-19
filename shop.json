@@ -1,1 +1,1 @@
-{"config":{"enabled":true,"announcement":"","addresses":{"btc":"","ltc":"","eth":"","sol":"","usdt":""},"limits":{"starter":50,"plus":30,"pro":20}},"orders":{},"txIndex":{}}
+{"config":{"enabled":true,"announcement":"","addresses":{"btc":"bc1qepk5d0ucdcd5kkgvzprnrmn9yqe7p4wgy3w49k","ltc":"LZEW73rdZcWn4Ls3AFJisMAEKVCsmWgxGN","eth":"0xe519fdDBbcD64FB5e0CD22Dc9dA498e9d7ecbf79"},"limits":{"starter":50,"plus":30,"pro":20}},"orders":{},"txIndex":{}}
