@@ -276,6 +276,7 @@ const SHOP_MEMPOOL = { btc: "https://mempool.space", ltc: "https://litecoinspace
 const SHOP_ETH_RPC = process.env.SHOP_RPC_ETH || "https://ethereum-rpc.publicnode.com";
 
 const SHOP_DATA_PATH = "shop.json";
+const SHOP_SITE = process.env.SITE_ORIGIN || "https://get-oxide.com";
 
 // Runtime state. `config` is editable from the admin panel and persisted, so the
 // deposit addresses can be changed without a redeploy.
@@ -283,14 +284,15 @@ const shopConfig = {
     enabled: true,
     announcement: "",
     addresses: { btc: "", ltc: "", eth: "" },
-    limits: SHOP_PACKS.reduce((acc, p) => (acc[p.id] = p.limit, acc), {})
+    limits: SHOP_PACKS.reduce((acc, p) => (acc[p.id] = p.limit, acc), {}),
+    discordWebhook: "" // where paid-order alerts are posted
 };
 const shopOrders = {};  // orderId -> order
 const shopTxIndex = {}; // txid -> orderId (a tx can only ever settle one order)
 const shopRates = { ts: 0, cents: {} };
 const shopIpLog = {};
 
-function shopHttpJson(url, opts) {
+function shopHttpJsonOnce(url, opts) {
     return new Promise((resolve, reject) => {
         let u;
         try { u = new URL(url); } catch (e) { return reject(new Error("bad url")); }
@@ -318,6 +320,30 @@ function shopHttpJson(url, opts) {
         if (body) req.write(body);
         req.end();
     });
+}
+
+// Public explorers and RPC endpoints blip (502/503, resets, timeouts). Every shop call is
+// a read, so retrying is safe and a lost poll never costs a payment. Up to 3 attempts.
+function shopRetryable(err) {
+    const m = String((err && err.message) || "");
+    return /upstream (429|5\d\d)/.test(m) || /timeout/.test(m) || /(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up)/.test(m);
+}
+async function shopHttpJson(url, opts) {
+    let last;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            return await shopHttpJsonOnce(url, opts);
+        } catch (e) {
+            last = e;
+            if (!shopRetryable(e) || attempt === 2) throw e;
+            await new Promise(r => setTimeout(r, 700 * Math.pow(2, attempt)));
+        }
+    }
+    throw last;
+}
+
+function shopNf(n) {
+    return Number(n || 0).toLocaleString("en-US");
 }
 
 // base units (BigInt) -> exact decimal string, e.g. 1234 sats -> "0.00001234"
@@ -453,6 +479,133 @@ async function shopIncomingEth(address, fromBlock) {
         }
     }
     return { incoming: out, tip };
+}
+
+// ── Discord alerts ──────────────────────────────────────────────────────────
+
+function shopWebhookUrl() {
+    return String(shopConfig.discordWebhook || process.env.SHOP_DISCORD_WEBHOOK || "").trim();
+}
+
+// https anywhere; plain http only to loopback so a webhook can never travel in
+// clear text to the open internet (loopback keeps local testing possible).
+function shopValidWebhook(value) {
+    const v = String(value == null ? "" : value).trim();
+    if (!v) return true; // empty = alerts off
+    let u;
+    try { u = new URL(v); } catch (_) { return false; }
+    if (u.protocol === "https:") return true;
+    return u.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]", "::1"].includes(u.hostname);
+}
+
+// Discord answers 204 with an empty body, so this cannot reuse shopHttpJson.
+function shopWebhookPost(url, payload) {
+    return new Promise((resolve, reject) => {
+        let u;
+        try { u = new URL(url); } catch (e) { return reject(new Error("bad webhook url")); }
+        const body = JSON.stringify(payload);
+        const lib = u.protocol === "http:" ? require("http") : https;
+        const req = lib.request({
+            host: u.hostname,
+            port: u.port || (u.protocol === "http:" ? 80 : 443),
+            path: u.pathname + u.search,
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "User-Agent": "oxide-shop" }
+        }, res => {
+            let d = "";
+            res.on("data", c => d += c);
+            res.on("end", () => resolve({ status: res.statusCode, body: d }));
+        });
+        req.setTimeout(12000, () => req.destroy(new Error("webhook timeout")));
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+    });
+}
+
+async function shopSendWebhook(payload) {
+    const url = shopWebhookUrl();
+    if (!url) return { ok: false, error: "no webhook configured" };
+    try {
+        const res = await shopWebhookPost(url, payload);
+        if (res.status >= 200 && res.status < 300) return { ok: true, status: res.status };
+        return { ok: false, error: "Discord returned " + res.status + (res.body ? ": " + res.body.slice(0, 180) : "") };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+function shopAlertEmbed(order, kind) {
+    const coin = SHOP_COINS[order.coin] || {};
+    const pack = order.packId ? SHOP_PACKS.find(p => p.id === order.packId) : null;
+    const underpaid = kind === "underpaid";
+    const detected = kind === "detected";
+    const fields = [
+        { name: "Order", value: "`" + order.ref + "`", inline: true },
+        { name: "Robux to deliver", value: shopNf(order.robux) + (pack ? " (" + pack.label + " pack)" : " (custom)"), inline: true },
+        { name: "Paid", value: "$" + (order.usdCents / 100).toFixed(2) + " in " + (coin.symbol || order.coin), inline: true },
+        { name: "Roblox account", value: "`" + order.robloxUsername + "`", inline: true },
+        { name: "Discord", value: order.discord ? "`" + order.discord + "`" : "—", inline: true },
+        { name: "Received", value: (order.received || "?") + " " + (coin.symbol || ""), inline: true }
+    ];
+    if (order.txid) {
+        const link = coin.explorer ? "[open on explorer](" + coin.explorer + order.txid + ")\n" : "";
+        fields.push({ name: "Transaction", value: link + "`" + String(order.txid).slice(0, 24) + "…`", inline: false });
+    }
+    const confs = order.confirmations || 0;
+    const need = coin.minConf || 1;
+    return {
+        username: "Oxide Shop",
+        content: underpaid
+            ? "@here an order was **underpaid** — check it before delivering."
+            : null,
+        embeds: [{
+            title: underpaid
+                ? "Underpaid order needs review"
+                : detected
+                    ? "Payment seen — " + shopNf(order.robux) + " Robux order incoming"
+                    : "Payment confirmed — deliver " + shopNf(order.robux) + " Robux",
+            url: SHOP_SITE + "/admin/shop/",
+            color: underpaid ? 0xe66767 : (detected ? 0xe4b96f : 0x6bcb77),
+            description: underpaid
+                ? "The transfer was below the exact amount for order **" + order.ref + "**. Contact the buyer (Discord above) before sending any Robux."
+                : detected
+                    ? "The transfer for **" + order.ref + "** just appeared on-chain with " + confs + "/" + need + " confirmations. You will get a second alert once it is confirmed — deliver **" + order.robloxUsername + "** then if you want to be safe."
+                    : "Confirmed on-chain. Send the Robux to **" + order.robloxUsername + "**, then mark the order **delivered** in the admin panel.",
+            fields,
+            footer: { text: "Oxide HUB shop" },
+            timestamp: new Date().toISOString()
+        }]
+    };
+}
+
+// Notifies once per order per kind, retrying a failed send no more than once a minute.
+async function shopMaybeNotify(order) {
+    if (!order || !shopWebhookUrl()) return { ok: false, error: "no webhook configured" };
+    const kind = ["paid", "detected", "underpaid"].includes(order.status) ? order.status : null;
+    if (!kind) return { ok: false, error: "nothing to notify" };
+    order.notified = order.notified || {};
+    if (order.notified[kind]) return { ok: true, already: true };
+    if (order.notified[kind + "Attempt"] && Date.now() - order.notified[kind + "Attempt"] < 60000) return { ok: false, error: "retry throttled" };
+    order.notified[kind + "Attempt"] = Date.now();
+    persistShop();
+    const res = await shopSendWebhook(shopAlertEmbed(order, kind));
+    if (res.ok) {
+        order.notified[kind] = Date.now();
+        order.notifyError = null;
+    } else {
+        order.notifyError = res.error;
+        console.log("Shop alert failed (" + kind + " " + order.ref + "): " + res.error);
+    }
+    persistShop();
+    return res;
+}
+
+// Every caller uses this wrapper so a status change always gets considered for an alert.
+async function shopCheckAndNotify(order) {
+    const res = await shopCheckOrder(order);
+    try { await shopMaybeNotify(order); } catch (e) { order.notifyError = e.message; }
+    return res;
 }
 
 // ── the matcher ─────────────────────────────────────────────────────────────
@@ -634,7 +787,7 @@ async function shopTick() {
             continue;
         }
         if (now - (o.lastCheck || 0) < 12000) continue;
-        try { await shopCheckOrder(o); } catch (e) { o.lastError = e.message; }
+        try { await shopCheckAndNotify(o); } catch (e) { o.lastError = e.message; }
     }
 }
 
@@ -1472,7 +1625,7 @@ const server = http.createServer((req, res) => {
         if (!order) return sendJson(404, { error: "Order not found" });
         const reply = () => sendJson(200, { ok: true, order: shopPublicOrder(order) });
         if (Date.now() - (order.lastCheck || 0) > 8000) {
-            return shopCheckOrder(order).then(reply).catch(reply);
+            return shopCheckAndNotify(order).then(reply).catch(reply);
         }
         return reply();
     }
@@ -1482,7 +1635,7 @@ const server = http.createServer((req, res) => {
         const id = pathname.slice("/shop/order/".length, -"check".length - 1);
         const order = shopOrders[id];
         if (!order) return sendJson(404, { error: "Order not found" });
-        return shopCheckOrder(order)
+        return shopCheckAndNotify(order)
             .then(() => sendJson(200, { ok: true, order: shopPublicOrder(order) }))
             .catch(e => sendJson(502, { error: "Could not reach the blockchain explorer: " + e.message }));
     }
@@ -1507,13 +1660,28 @@ const server = http.createServer((req, res) => {
         });
     }
 
+    // POST /admin/api/shop/test-alert — send a sample alert to the configured webhook
+    if (req.method === "POST" && pathname === "/admin/api/shop/test-alert") {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        if (!shopWebhookUrl()) return sendJson(400, { error: "No webhook configured yet" });
+        const sample = {
+            ref: "TEST01", coin: "btc", symbol: "BTC", coinName: "Bitcoin",
+            robux: 100000, usdCents: 5000, packId: "starter", received: "0.00061513",
+            robloxUsername: "OxideBuyer", discord: "oxide", txid: "test0" + crypto.randomBytes(4).toString("hex")
+        };
+        return shopSendWebhook(shopAlertEmbed(sample, "paid")).then(res => {
+            if (res.ok) return sendJson(200, { ok: true, status: res.status });
+            sendJson(502, { error: res.error });
+        });
+    }
+
     // POST /admin/api/shop/orders/:id/check — re-check a late payment by hand
     if (req.method === "POST" && pathname.startsWith("/admin/api/shop/orders/") && pathname.endsWith("/check")) {
         if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
         const id = decodeURIComponent(pathname.slice("/admin/api/shop/orders/".length, -"check".length - 1));
         const order = shopOrders[id];
         if (!order) return sendJson(404, { error: "Order not found" });
-        return shopCheckOrder(order)
+        return shopCheckAndNotify(order)
             .then(() => sendJson(200, { ok: true, order: shopPublicOrder(order) }))
             .catch(e => sendJson(502, { error: "Chain lookup failed: " + e.message }));
     }
@@ -1559,6 +1727,11 @@ const server = http.createServer((req, res) => {
             }
             if (body.enabled != null) shopConfig.enabled = !!body.enabled;
             if (body.announcement != null) shopConfig.announcement = String(body.announcement).slice(0, 240);
+            if (body.discordWebhook != null) {
+                const hook = String(body.discordWebhook).trim().slice(0, 400);
+                if (!shopValidWebhook(hook)) errors.push("Webhook must be an https URL (Discord webhooks look like https://discord.com/api/webhooks/…)");
+                else shopConfig.discordWebhook = hook;
+            }
             persistShop();
             sendJson(200, { ok: true, config: shopConfig, errors });
         });
