@@ -1,1 +1,1 @@
-{"config":{"enabled":true,"announcement":"direct-body-test","addresses":{"btc":"","ltc":"","eth":"","sol":"","usdt":""},"limits":{"starter":50,"plus":30,"pro":20}},"orders":{},"txIndex":{}}
+{"config":{"enabled":true,"announcement":"","addresses":{"btc":"","ltc":"","eth":"","sol":"","usdt":""},"limits":{"starter":50,"plus":30,"pro":20}},"orders":{},"txIndex":{}}
