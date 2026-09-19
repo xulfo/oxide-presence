@@ -235,11 +235,14 @@ function resolvePlaceName(placeId) {
 // control room can never disagree about the list or the count.
 function allTrackedGames() {
     const byName = new Map();
+    // Curated = a game the hub ships a script for (BASELINE_GAMES). Everything else in
+    // here was discovered at runtime, so clients can present the two groups separately.
+    const curated = new Set(BASELINE_GAMES.map(g => String(g.name).toLowerCase()));
     const ensure = (name, placeId) => {
         const key = String(name).toLowerCase();
         let e = byName.get(key);
         if (!e) {
-            e = { name: String(name), place_id: placeId || 0, universe_id: 0, launches: 0 };
+            e = { name: String(name), place_id: placeId || 0, universe_id: 0, launches: 0, curated: curated.has(key) };
             byName.set(key, e);
         } else if (!e.place_id && placeId) {
             e.place_id = placeId;
