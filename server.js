@@ -26,6 +26,7 @@ const sessions = {};    // session token -> discord user info
 const GH_DATA_TOKEN = process.env.GH_DATA_TOKEN || ""; // set via Koyeb env (never commit tokens)
 const GH_DATA_REPO = "xulfo/oxide-presence";
 const GH_DATA_PATH = "profiles.json";
+const GAMES_DATA_PATH = "games.json";
 
 function ghApi(method, path, body) {
     if (!GH_DATA_TOKEN) return Promise.resolve({ status: 401, body: "{}" });
@@ -219,6 +220,7 @@ function resolvePlaceName(placeId) {
                             GAME_NAMES[placeId] = String(g.name);
                             UNIVERSE_IDS[placeId] = universeId;
                             console.log(`Auto-registered game "${g.name}" (place ${placeId})`);
+                            persistGames();
                         }
                     } catch (_) {}
                     done();
@@ -249,6 +251,46 @@ function allTrackedGames() {
     for (const [name, launches] of Object.entries(gameLaunches)) ensure(name, 0).launches += launches;
     for (const e of byName.values()) e.universe_id = UNIVERSE_IDS[e.place_id] || 0;
     return Array.from(byName.values()).sort((a, b) => b.launches - a.launches);
+}
+
+// Discovered games and real launch counters are persisted so a redeploy does not shrink
+// the catalog back to the hardcoded baseline.
+let gamesPersistTimer = null;
+let gamesPersistDirty = false;
+function persistGames() {
+    gamesPersistDirty = true;
+    if (gamesPersistTimer) return;
+    gamesPersistTimer = setTimeout(async () => {
+        gamesPersistTimer = null;
+        if (!gamesPersistDirty) return;
+        gamesPersistDirty = false;
+        const snapshot = JSON.stringify({ names: placeNameCache, launches: gameLaunches, unsupported: unsupportedLaunches });
+        try {
+            const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${GAMES_DATA_PATH}`);
+            const payload = { content: Buffer.from(snapshot, "utf8").toString("base64"), message: "games update", branch: "main" };
+            if (res.status === 200) payload.sha = JSON.parse(res.body).sha;
+            const put = await ghApi("PUT", `/repos/${GH_DATA_REPO}/contents/${GAMES_DATA_PATH}`, payload);
+            if (put.status !== 200 && put.status !== 201) console.log("Games save skipped (" + put.status + ")");
+        } catch (e) { console.log("Games save failed: " + e.message); }
+    }, 5000);
+}
+
+async function loadGamesFromGitHub() {
+    try {
+        const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${GAMES_DATA_PATH}`);
+        if (res.status !== 200) return;
+        const saved = JSON.parse(Buffer.from(JSON.parse(res.body).content, "base64").toString("utf8"));
+        for (const [pid, name] of Object.entries(saved.names || {})) {
+            placeNameCache[pid] = name;
+            if (!GAME_NAMES[pid]) GAME_NAMES[pid] = name;
+        }
+        for (const [name, count] of Object.entries(saved.launches || {})) {
+            gameLaunches[name] = Math.max(gameLaunches[name] || 0, count);
+        }
+        if (saved.unsupported) unsupportedLaunches = Math.max(unsupportedLaunches, saved.unsupported);
+        const known = Object.keys(saved.names || {}).length;
+        if (known) console.log("Loaded " + known + " discovered games from GitHub");
+    } catch (e) { console.log("Games load skipped: " + e.message); }
 }
 
 const avatarCache = {};
@@ -877,6 +919,9 @@ function shopValidAddress(coinKey, value) {
 // all orders on redeploy.
 shopStart();
 
+// Restore auto-discovered games + real launch counters so the catalog survives a redeploy.
+loadGamesFromGitHub().catch(() => {});
+
 const server = http.createServer((req, res) => {
     // Exact Origin reflection to satisfy browser CORS requirement with credentials: 'include'
     const origin = req.headers.origin;
@@ -926,9 +971,7 @@ const server = http.createServer((req, res) => {
 
     // Health check
     if (pathname === "/" || pathname === "/health") {
-        const uniqueNames = new Set(Object.values(GAME_NAMES));
-        uniqueNames.add("Universal");
-        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: uniqueNames.size });
+        return sendJson(200, { ok: true, service: "oxide-hub", supported_games: allTrackedGames().length });
     }
 
     // Roblox API proxy (Roblox sends no CORS headers, so browsers can't call it directly)
@@ -1341,6 +1384,7 @@ const server = http.createServer((req, res) => {
             } else {
                 gameLaunches[gName] = (gameLaunches[gName] || 0) + 1;
             }
+            persistGames(); // debounced: keeps the catalog + counters across redeploys
 
             const shouldKick = pendingKicks[uid] === true;
             if (shouldKick) {
