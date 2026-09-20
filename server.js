@@ -186,62 +186,28 @@ const UNIVERSE_IDS = {
     17625359962: 6035872082
 };
 
-// Games the hub has executed that nobody has named yet. A client only reports a
-// placeId, so an unknown one is resolved against Roblox once and then becomes a
-// first-class supported game (live + execution stats + the website list).
-const placeNameCache = {};   // placeId -> resolved game name
-const placeNamePending = {}; // placeId -> lookup in flight
+// Which game a client is in is decided by place id alone, against a fixed set of games
+// the hub actually supports (GAME_NAMES above). Anything else is simply not tracked —
+// auto-registering every place the hub is run in only ever produced a catalog of games
+// nobody supports, so there is no discovery step at all.
+const SUPPORTED_NAMES = new Set(
+    [...BASELINE_GAMES.map(g => g.name), ...Object.values(GAME_NAMES)].map(n => String(n).toLowerCase())
+);
 
-function shopGuessName(placeId) {
-    return GAME_NAMES[placeId] || placeNameCache[placeId] || null;
+function knownGameName(placeId) {
+    return GAME_NAMES[placeId] || null;
 }
 
-function resolvePlaceName(placeId) {
-    if (!placeId || shopGuessName(placeId) || placeNamePending[placeId]) return;
-    placeNamePending[placeId] = true;
-    const https = require("https");
-    const done = () => { delete placeNamePending[placeId]; };
-    https.get({ host: "apis.roblox.com", path: `/universes/v1/places/${placeId}/universe`, headers: { "User-Agent": "oxide-hub" } }, r => {
-        let d = "";
-        r.on("data", c => d += c);
-        r.on("end", () => {
-            let universeId = 0;
-            try { universeId = Number((JSON.parse(d) || {}).universeId) || 0; } catch (_) {}
-            if (!universeId) return done();
-            https.get({ host: "games.roblox.com", path: `/v1/games?universeIds=${universeId}`, headers: { "User-Agent": "oxide-hub" } }, r2 => {
-                let d2 = "";
-                r2.on("data", c => d2 += c);
-                r2.on("end", () => {
-                    try {
-                        const g = ((JSON.parse(d2) || {}).data || [])[0];
-                        if (g && g.name) {
-                            placeNameCache[placeId] = String(g.name);
-                            GAME_NAMES[placeId] = String(g.name);
-                            UNIVERSE_IDS[placeId] = universeId;
-                            console.log(`Auto-registered game "${g.name}" (place ${placeId})`);
-                            persistGames();
-                        }
-                    } catch (_) {}
-                    done();
-                });
-            }).on("error", done);
-        });
-    }).on("error", done);
-}
-
-// The single source of truth for "which games are supported". Baseline numbers, real
-// launch counters and auto-discovered games are merged here, so /games, /stats and the
-// control room can never disagree about the list or the count.
+// The single source of truth for "which games are supported": the curated set plus the
+// real launch counters fed by /register, so /games, /stats and the control room can
+// never disagree about the list or the count.
 function allTrackedGames() {
     const byName = new Map();
-    // Curated = a game the hub ships a script for (BASELINE_GAMES). Everything else in
-    // here was discovered at runtime, so clients can present the two groups separately.
-    const curated = new Set(BASELINE_GAMES.map(g => String(g.name).toLowerCase()));
     const ensure = (name, placeId) => {
         const key = String(name).toLowerCase();
         let e = byName.get(key);
         if (!e) {
-            e = { name: String(name), place_id: placeId || 0, universe_id: 0, launches: 0, curated: curated.has(key) };
+            e = { name: String(name), place_id: placeId || 0, universe_id: 0, launches: 0, curated: true };
             byName.set(key, e);
         } else if (!e.place_id && placeId) {
             e.place_id = placeId;
@@ -250,13 +216,15 @@ function allTrackedGames() {
     };
     for (const g of BASELINE_GAMES) ensure(g.name, g.place_id).launches += g.launches;
     for (const pid of Object.keys(GAME_NAMES)) ensure(GAME_NAMES[pid], Number(pid));
-    for (const [name, launches] of Object.entries(gameLaunches)) ensure(name, 0).launches += launches;
+    for (const [name, launches] of Object.entries(gameLaunches)) {
+        if (SUPPORTED_NAMES.has(String(name).toLowerCase())) ensure(name, 0).launches += launches;
+    }
     for (const e of byName.values()) e.universe_id = UNIVERSE_IDS[e.place_id] || 0;
     return Array.from(byName.values()).sort((a, b) => b.launches - a.launches);
 }
 
-// Discovered games and real launch counters are persisted so a redeploy does not shrink
-// the catalog back to the hardcoded baseline.
+// Real launch counters are persisted so a redeploy does not reset them. Counters for
+// games that are not supported are dropped, which also prunes the old discovery junk.
 let gamesPersistTimer = null;
 let gamesPersistDirty = false;
 function persistGames() {
@@ -266,7 +234,11 @@ function persistGames() {
         gamesPersistTimer = null;
         if (!gamesPersistDirty) return;
         gamesPersistDirty = false;
-        const snapshot = JSON.stringify({ names: placeNameCache, launches: gameLaunches });
+        const counters = {};
+        for (const [name, count] of Object.entries(gameLaunches)) {
+            if (SUPPORTED_NAMES.has(String(name).toLowerCase())) counters[name] = count;
+        }
+        const snapshot = JSON.stringify({ launches: counters });
         try {
             const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${GAMES_DATA_PATH}`);
             const payload = { content: Buffer.from(snapshot, "utf8").toString("base64"), message: "games update", branch: "main" };
@@ -282,15 +254,11 @@ async function loadGamesFromGitHub() {
         const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${GAMES_DATA_PATH}`);
         if (res.status !== 200) return;
         const saved = JSON.parse(Buffer.from(JSON.parse(res.body).content, "base64").toString("utf8"));
-        for (const [pid, name] of Object.entries(saved.names || {})) {
-            placeNameCache[pid] = name;
-            if (!GAME_NAMES[pid]) GAME_NAMES[pid] = name;
-        }
         for (const [name, count] of Object.entries(saved.launches || {})) {
+            if (!SUPPORTED_NAMES.has(String(name).toLowerCase())) continue; // discovery-era leftovers
             gameLaunches[name] = Math.max(gameLaunches[name] || 0, count);
         }
-        const known = Object.keys(saved.names || {}).length;
-        if (known) console.log("Loaded " + known + " discovered games from GitHub");
+        console.log("Loaded launch counters for " + Object.keys(gameLaunches).length + " supported games");
     } catch (e) { console.log("Games load skipped: " + e.message); }
 }
 
@@ -1453,12 +1421,12 @@ const server = http.createServer((req, res) => {
                 join_url: jobId ? `roblox://experiences/start?placeId=${placeId}&gameInstanceId=${jobId}` : ""
             };
 
-            // A client only reports a placeId, so an unknown one is resolved against
-            // Roblox and tracked as a real game from then on — nothing is bucketed away.
-            const gName = shopGuessName(placeId);
-            if (gName) gameLaunches[gName] = (gameLaunches[gName] || 0) + 1;
-            else resolvePlaceName(placeId); // learn the game so it is tracked from now on
-            persistGames(); // debounced: keeps the catalog + counters across redeploys
+            // Only a supported game counts toward the per-game execution stats.
+            const gName = knownGameName(placeId);
+            if (gName) {
+                gameLaunches[gName] = (gameLaunches[gName] || 0) + 1;
+                persistGames(); // debounced: keeps the counters across redeploys
+            }
 
             const shouldKick = pendingKicks[uid] === true;
             if (shouldKick) {
@@ -1505,10 +1473,10 @@ const server = http.createServer((req, res) => {
         const execMap = {};
 
         for (const c of alive) {
-            const known = shopGuessName(c.placeId);
-            if (!known) resolvePlaceName(c.placeId);
-            const gName = known || "Unsupported";
-            gameMap[gName] = (gameMap[gName] || 0) + 1;
+            // Only supported games are listed; a client in anything else still counts
+            // toward the overall online total, it just has no row.
+            const gName = knownGameName(c.placeId);
+            if (gName) gameMap[gName] = (gameMap[gName] || 0) + 1;
             const exec = c.executor || "Unknown";
             execMap[exec] = (execMap[exec] || 0) + 1;
         }
