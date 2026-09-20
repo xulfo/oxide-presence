@@ -170,7 +170,6 @@ const BASELINE_GAMES = [
 // the BASELINE_GAMES numbers so every supported game — including new ones —
 // is actually tracked in the executions stats, not just the baseline.
 const gameLaunches = {};      // game name -> real launch count
-let unsupportedLaunches = 0;  // real launches from unknown place ids
 
 // place_id -> universe_id (used by the /banner route to fetch real game thumbnails)
 const UNIVERSE_IDS = {
@@ -267,7 +266,7 @@ function persistGames() {
         gamesPersistTimer = null;
         if (!gamesPersistDirty) return;
         gamesPersistDirty = false;
-        const snapshot = JSON.stringify({ names: placeNameCache, launches: gameLaunches, unsupported: unsupportedLaunches });
+        const snapshot = JSON.stringify({ names: placeNameCache, launches: gameLaunches });
         try {
             const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${GAMES_DATA_PATH}`);
             const payload = { content: Buffer.from(snapshot, "utf8").toString("base64"), message: "games update", branch: "main" };
@@ -290,7 +289,6 @@ async function loadGamesFromGitHub() {
         for (const [name, count] of Object.entries(saved.launches || {})) {
             gameLaunches[name] = Math.max(gameLaunches[name] || 0, count);
         }
-        if (saved.unsupported) unsupportedLaunches = Math.max(unsupportedLaunches, saved.unsupported);
         const known = Object.keys(saved.names || {}).length;
         if (known) console.log("Loaded " + known + " discovered games from GitHub");
     } catch (e) { console.log("Games load skipped: " + e.message); }
@@ -597,6 +595,60 @@ function shopWebhookUrl() {
     return String(shopConfig.discordWebhook || process.env.SHOP_DISCORD_WEBHOOK || "").trim();
 }
 
+// The order data lives in a public repo, so a webhook must never be written there in
+// clear text. It is sealed with AES-256-GCM under a key derived from a server-only
+// secret (SHOP_SECRET_KEY, falling back to the deploy token), which means the stored
+// blob is useless to anyone reading the repo. The plaintext only ever exists in memory.
+function shopWebhookKey() {
+    const secret = process.env.SHOP_SECRET_KEY || process.env.GH_DATA_TOKEN || "";
+    if (!secret) return null;
+    return crypto.createHash("sha256").update("oxide-shop-webhook:" + secret).digest();
+}
+
+function shopSealWebhook(value) {
+    const key = shopWebhookKey();
+    if (!key || !value) return "";
+    try {
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+        const enc = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
+        return ["v1", iv.toString("base64"), cipher.getAuthTag().toString("base64"), enc.toString("base64")].join(":");
+    } catch (_) { return ""; }
+}
+
+function shopUnsealWebhook(sealed) {
+    const key = shopWebhookKey();
+    if (!key || !sealed) return "";
+    const parts = String(sealed).split(":");
+    if (parts.length !== 4 || parts[0] !== "v1") return "";
+    try {
+        const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(parts[1], "base64"));
+        decipher.setAuthTag(Buffer.from(parts[2], "base64"));
+        const out = Buffer.concat([decipher.update(Buffer.from(parts[3], "base64")), decipher.final()]);
+        return out.toString("utf8");
+    } catch (_) { return ""; }
+}
+
+// Never hand the secret itself to a browser — not even to the admin panel. It gets a
+// short fingerprint so the panel can show which webhook is active.
+function shopWebhookFingerprint(url) {
+    const v = String(url || "");
+    if (!v) return "";
+    return "…" + v.slice(-4);
+}
+
+function shopAdminConfig() {
+    const url = shopWebhookUrl();
+    const cfg = Object.assign({}, shopConfig);
+    delete cfg.discordWebhook;
+    cfg.webhook = {
+        set: !!url,
+        source: shopConfig.discordWebhook ? "panel" : (process.env.SHOP_DISCORD_WEBHOOK ? "env" : "none"),
+        fingerprint: shopWebhookFingerprint(url)
+    };
+    return cfg;
+}
+
 // https anywhere; plain http only to loopback so a webhook can never travel in
 // clear text to the open internet (loopback keeps local testing possible).
 function shopValidWebhook(value) {
@@ -842,7 +894,17 @@ function shopPackStatus() {
 
 let shopPersistTimer = null;
 function persistShop() {
-    const snapshot = JSON.stringify({ config: shopConfig, orders: shopOrders, txIndex: shopTxIndex });
+    // Never persist the webhook in clear text, and never persist buyer IPs — the GitHub
+    // mirror of this file is world-readable.
+    const cfg = Object.assign({}, shopConfig);
+    delete cfg.discordWebhook;
+    const orders = {};
+    for (const [id, o] of Object.entries(shopOrders)) {
+        const copy = Object.assign({}, o);
+        delete copy.ip;
+        orders[id] = copy;
+    }
+    const snapshot = JSON.stringify({ config: cfg, webhookSealed: shopSealWebhook(shopConfig.discordWebhook), orders, txIndex: shopTxIndex });
     try { fs.writeFileSync("./shop-data.json", snapshot); } catch (_) {}
     if (shopPersistTimer) return;
     shopPersistTimer = setTimeout(async () => {
@@ -862,7 +924,15 @@ async function loadShopFromGitHub() {
         const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${SHOP_DATA_PATH}`);
         if (res.status === 200) {
             const saved = JSON.parse(Buffer.from(JSON.parse(res.body).content, "base64").toString("utf8"));
-            if (saved.config) Object.assign(shopConfig, saved.config);
+            // A leaked clear-text webhook may still sit in the old file: ignore it and
+            // only trust the sealed value.
+            if (saved.config) {
+                const cfg = Object.assign({}, saved.config);
+                delete cfg.discordWebhook;
+                Object.assign(shopConfig, cfg);
+            }
+            if (shopConfig.discordWebhook) shopConfig.discordWebhook = "";
+            if (saved.webhookSealed) shopConfig.discordWebhook = shopUnsealWebhook(saved.webhookSealed);
             if (saved.config && saved.config.addresses) shopConfig.addresses = saved.config.addresses;
             // Drop keys for coins that no longer exist (an older config could still
             // carry sol/usdt addresses) and make sure every live coin has a slot.
@@ -877,7 +947,10 @@ async function loadShopFromGitHub() {
         if (fs.existsSync("./shop-data.json")) {
             const saved = JSON.parse(fs.readFileSync("./shop-data.json", "utf8"));
             if (saved.config && !Object.keys(shopOrders).length) {
-                Object.assign(shopConfig, saved.config);
+                const cfg = Object.assign({}, saved.config);
+                delete cfg.discordWebhook;
+                Object.assign(shopConfig, cfg);
+                if (saved.webhookSealed && !shopConfig.discordWebhook) shopConfig.discordWebhook = shopUnsealWebhook(saved.webhookSealed);
                 if (saved.config.addresses) shopConfig.addresses = saved.config.addresses;
                 for (const key of Object.keys(shopConfig.addresses)) if (!SHOP_COINS[key]) delete shopConfig.addresses[key];
                 for (const key of Object.keys(SHOP_COINS)) if (shopConfig.addresses[key] == null) shopConfig.addresses[key] = "";
@@ -1380,13 +1453,11 @@ const server = http.createServer((req, res) => {
                 join_url: jobId ? `roblox://experiences/start?placeId=${placeId}&gameInstanceId=${jobId}` : ""
             };
 
-            const gName = shopGuessName(placeId) || "Unsupported";
-            if (gName === "Unsupported") {
-                unsupportedLaunches += 1;
-                resolvePlaceName(placeId); // learn the game so it is tracked from now on
-            } else {
-                gameLaunches[gName] = (gameLaunches[gName] || 0) + 1;
-            }
+            // A client only reports a placeId, so an unknown one is resolved against
+            // Roblox and tracked as a real game from then on — nothing is bucketed away.
+            const gName = shopGuessName(placeId);
+            if (gName) gameLaunches[gName] = (gameLaunches[gName] || 0) + 1;
+            else resolvePlaceName(placeId); // learn the game so it is tracked from now on
             persistGames(); // debounced: keeps the catalog + counters across redeploys
 
             const shouldKick = pendingKicks[uid] === true;
@@ -1480,7 +1551,6 @@ const server = http.createServer((req, res) => {
             total: totalExecutions,
             start_date: start.toISOString().slice(0, 10),
             end_date: now.toISOString().slice(0, 10),
-            unsupported: 1420 + unsupportedLaunches,
             games: games
         });
     }
@@ -1774,7 +1844,7 @@ const server = http.createServer((req, res) => {
         return sendJson(200, {
             ok: true,
             orders,
-            config: shopConfig,
+            config: shopAdminConfig(),
             rates: shopRates.cents,
             rateAge: Date.now() - shopRates.ts,
             packs: shopPackStatus().packs,
@@ -1855,7 +1925,7 @@ const server = http.createServer((req, res) => {
                 else shopConfig.discordWebhook = hook;
             }
             persistShop();
-            sendJson(200, { ok: true, config: shopConfig, errors });
+            sendJson(200, { ok: true, config: shopAdminConfig(), errors });
         });
     }
 
