@@ -862,8 +862,10 @@ function shopPackStatus() {
 
 let shopPersistTimer = null;
 function persistShop() {
-    // Never persist the webhook in clear text, and never persist buyer IPs — the GitHub
-    // mirror of this file is world-readable.
+    // The container's own file is private, so it keeps the full state (including the
+    // webhook) and is the first thing read back on boot. The GitHub mirror of this file
+    // is world-readable, so that copy is sanitised: no clear-text webhook, no buyer IPs.
+    const localSnapshot = JSON.stringify({ config: shopConfig, orders: shopOrders, txIndex: shopTxIndex });
     const cfg = Object.assign({}, shopConfig);
     delete cfg.discordWebhook;
     const orders = {};
@@ -873,7 +875,7 @@ function persistShop() {
         orders[id] = copy;
     }
     const snapshot = JSON.stringify({ config: cfg, webhookSealed: shopSealWebhook(shopConfig.discordWebhook), orders, txIndex: shopTxIndex });
-    try { fs.writeFileSync("./shop-data.json", snapshot); } catch (_) {}
+    try { fs.writeFileSync("./shop-data.json", localSnapshot); } catch (_) {}
     if (shopPersistTimer) return;
     shopPersistTimer = setTimeout(async () => {
         shopPersistTimer = null;
@@ -915,10 +917,8 @@ async function loadShopFromGitHub() {
         if (fs.existsSync("./shop-data.json")) {
             const saved = JSON.parse(fs.readFileSync("./shop-data.json", "utf8"));
             if (saved.config && !Object.keys(shopOrders).length) {
-                const cfg = Object.assign({}, saved.config);
-                delete cfg.discordWebhook;
-                Object.assign(shopConfig, cfg);
-                if (saved.webhookSealed && !shopConfig.discordWebhook) shopConfig.discordWebhook = shopUnsealWebhook(saved.webhookSealed);
+                // This file never leaves the server, so its webhook is trusted as-is.
+                Object.assign(shopConfig, saved.config);
                 if (saved.config.addresses) shopConfig.addresses = saved.config.addresses;
                 for (const key of Object.keys(shopConfig.addresses)) if (!SHOP_COINS[key]) delete shopConfig.addresses[key];
                 for (const key of Object.keys(SHOP_COINS)) if (shopConfig.addresses[key] == null) shopConfig.addresses[key] = "";
