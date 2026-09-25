@@ -670,14 +670,21 @@ function shopAlertEmbed(order, kind) {
     const pack = order.packId ? SHOP_PACKS.find(p => p.id === order.packId) : null;
     const underpaid = kind === "underpaid";
     const detected = kind === "detected";
+    const isPlan = order.kind === "plan";
     const fields = [
         { name: "Order", value: "`" + order.ref + "`", inline: true },
-        { name: "Robux to deliver", value: shopNf(order.robux) + (pack ? " (" + pack.label + " pack)" : " (custom)"), inline: true },
+        isPlan
+            ? { name: "Plan", value: arcPlanLabel(order.planId) + (order.planId === "lifetime" ? " (never expires)" : ""), inline: true }
+            : { name: "Robux to deliver", value: shopNf(order.robux) + (pack ? " (" + pack.label + " pack)" : " (custom)"), inline: true },
         { name: "Paid", value: "$" + (order.usdCents / 100).toFixed(2) + " in " + (coin.symbol || order.coin), inline: true },
-        { name: "Roblox account", value: "`" + order.robloxUsername + "`", inline: true },
+        isPlan
+            ? { name: "Key is issued", value: "automatically — the buyer sees it on the order page", inline: true }
+            : { name: "Roblox account", value: "`" + order.robloxUsername + "`", inline: true },
         { name: "Discord", value: order.discord ? "`" + order.discord + "`" : "—", inline: true },
         { name: "Received", value: (order.received || "?") + " " + (coin.symbol || ""), inline: true }
     ];
+    const issued = arcLicensesForOrder(order)[0];
+    if (issued) fields.push({ name: "Key", value: "`" + arcLicensePlain(issued) + "`" + (issued.hwid ? " \u00b7 bound" : " \u00b7 not activated yet"), inline: false });
     if (order.txid) {
         const link = coin.explorer ? "[open on explorer](" + coin.explorer + order.txid + ")\n" : "";
         fields.push({ name: "Transaction", value: link + "`" + String(order.txid).slice(0, 24) + "…`", inline: false });
@@ -693,17 +700,19 @@ function shopAlertEmbed(order, kind) {
             title: underpaid
                 ? "Underpaid order needs review"
                 : detected
-                    ? "Payment seen — " + shopNf(order.robux) + " Robux order incoming"
-                    : "Payment confirmed — deliver " + shopNf(order.robux) + " Robux",
+                    ? "Payment seen — " + (isPlan ? arcPlanLabel(order.planId) + " plan" : shopNf(order.robux) + " Robux order") + " incoming"
+                    : "Payment confirmed — " + (isPlan ? arcPlanLabel(order.planId) + " plan, key issued" : "deliver " + shopNf(order.robux) + " Robux"),
             url: SHOP_SITE + "/admin/shop/",
             color: underpaid ? 0xe66767 : (detected ? 0xe4b96f : 0x6bcb77),
-            description: underpaid
-                ? "The transfer was below the exact amount for order **" + order.ref + "**. Contact the buyer (Discord above) before sending any Robux."
+            description: (underpaid
+                ? "The transfer was below the exact amount for order **" + order.ref + "**. Contact the buyer (Discord above) before sending any" + (isPlan ? " key." : " Robux.")
                 : detected
-                    ? "The transfer for **" + order.ref + "** just appeared on-chain with " + confs + "/" + need + " confirmations. You will get a second alert once it is confirmed — deliver **" + order.robloxUsername + "** then if you want to be safe."
-                    : "Confirmed on-chain. Send the Robux to **" + order.robloxUsername + "**, then mark the order **delivered** in the admin panel.",
+                    ? "The transfer for **" + order.ref + "** just appeared on-chain with " + confs + "/" + need + " confirmations. You will get a second alert once it is confirmed." + (isPlan ? "" : " Deliver **" + order.robloxUsername + "** then if you want to be safe.")
+                    : (isPlan
+                        ? "Confirmed on-chain. The plan key for **" + order.ref + "** has been issued automatically — it is on the buyer's order page, and it binds to the first PC that activates it."
+                        : "Confirmed on-chain. Send the Robux to **" + order.robloxUsername + "**, then mark the order **delivered** in the admin panel.")),
             fields,
-            footer: { text: "Oxide HUB shop" },
+            footer: { text: "Arc HUB shop" },
             timestamp: new Date().toISOString()
         }]
     };
@@ -734,6 +743,9 @@ async function shopMaybeNotify(order) {
 // Every caller uses this wrapper so a status change always gets considered for an alert.
 async function shopCheckAndNotify(order) {
     const res = await shopCheckOrder(order);
+    // A plan order that just flipped to paid gets its key minted here, so the
+    // buyer sees it the moment the payment confirms.
+    try { arcEnsureLicenseForOrder(order); } catch (e) { console.log("License issue failed: " + e.message); }
     try { await shopMaybeNotify(order); } catch (e) { order.notifyError = e.message; }
     return res;
 }
@@ -810,9 +822,11 @@ async function shopCheckOrder(order) {
 function shopPublicOrder(o) {
     const coin = SHOP_COINS[o.coin] || {};
     const amount = shopFormatUnits(o.amountBase, coin.decimals || 8, coin.dp || 8);
+    const license = arcLicensesForOrder(o)[0] || null;
     return {
         id: o.id,
         ref: o.ref,
+        kind: o.kind || "robux",
         status: o.status,
         coin: o.coin,
         coinName: coin.name || o.coin,
@@ -821,8 +835,12 @@ function shopPublicOrder(o) {
         amount,
         paymentUri: coin.scheme ? `${coin.scheme}:${o.address}?amount=${amount}` : null,
         usd: (o.usdCents / 100).toFixed(2),
-        robux: o.robux,
+        robux: o.robux || 0,
         packId: o.packId,
+        plan: o.planId || null,
+        planLabel: o.planId ? arcPlanLabel(o.planId) : null,
+        planDays: o.planId ? (arcPlan(o.planId) || {}).days : null,
+        license: license && ["paid", "delivered"].includes(o.status) ? arcLicenseBuyerView(license) : null,
         createdAt: o.createdAt,
         expiresAt: o.expiresAt,
         secondsLeft: Math.max(0, Math.round((o.expiresAt - Date.now()) / 1000)),
@@ -832,7 +850,7 @@ function shopPublicOrder(o) {
         requiredConfirmations: coin.minConf || 1,
         received: o.received || null,
         underpaid: !!o.underpaid,
-        robloxUsername: o.robloxUsername,
+        robloxUsername: o.robloxUsername || null,
         discord: o.discord || null,
         lastError: o.lastError || null
     };
@@ -958,10 +976,328 @@ function shopValidAddress(coinKey, value) {
     return false;
 }
 
+/* ══ Arc License — plans, keys, HWID binding ══════════════════════════════════
+   The shop sells two things: Robux, and a *plan*. Paying for a plan mints a
+   key. A key binds itself to the first PC that activates it (HWID), so it is
+   usable by exactly one person, and it deletes itself the moment it stops
+   being valid (expired or revoked). There is no free plan.
+
+   Storage note: license records live in the same public data repo as the shop
+   orders, so the plaintext key is never written there — the mirror only gets a
+   SHA-256 lookup hash (activation works off that hash) plus the key sealed with
+   AES-256-GCM under a server-only secret, which is only used to re-display a
+   key in the admin panel. */
+
+const ARC_PLANS = [
+    {
+        id: "weekly", label: "Weekly", usdCents: 500, days: 7,
+        blurb: "A week of full access — try everything before you commit.",
+        perks: ["Full script catalog", "Every supported game", "Loader + UI updates", "Support on Discord"]
+    },
+    {
+        id: "monthly", label: "Monthly", usdCents: 999, days: 30, best: true,
+        blurb: "The plan most people stay on. Cheapest per day.",
+        perks: ["Everything in Weekly", "Best price per day", "Priority support", "Early access to new games"]
+    },
+    {
+        id: "lifetime", label: "Lifetime", usdCents: 1999, days: 0,
+        blurb: "Pay once. The key never expires.",
+        perks: ["Everything in Monthly", "Never expires", "Every future update", "Founder badge on Discord"]
+    }
+];
+
+const ARC_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I — keys get typed by hand
+const LICENSE_DATA_PATH = "licenses.json";
+const LICENSE_ARCHIVE_MAX = 60;
+const LICENSE_MIN_HWID = 6;
+
+const licenses = {};        // key id -> license record
+const licenseArchive = [];  // keys that deleted themselves (expired / revoked)
+const licenseIpLog = {};
+let licenseIssued = 0;
+
+function arcKeyNormalize(value) {
+    const raw = String(value == null ? "" : value).toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const body = raw.startsWith("ARC") && raw.length === 15 ? raw.slice(3) : raw;
+    if (body.length !== 12) return null;
+    for (const ch of body) if (ARC_KEY_ALPHABET.indexOf(ch) < 0) return null;
+    return body;
+}
+function arcKeyDisplay(body) { return "ARC-" + body.slice(0, 4) + "-" + body.slice(4, 8) + "-" + body.slice(8, 12); }
+function arcKeyRandom() {
+    const bytes = crypto.randomBytes(12);
+    let out = "";
+    for (let i = 0; i < 12; i++) out += ARC_KEY_ALPHABET[bytes[i] % ARC_KEY_ALPHABET.length];
+    return out;
+}
+// The lookup hash is what the store keys off, so a leaked mirror cannot be used
+// to find a working key and activation never needs the plaintext to exist.
+function arcKeyHash(body) { return crypto.createHash("sha256").update("arc-license-key:" + body).digest("hex"); }
+
+function arcHwid(value) {
+    const v = String(value == null ? "" : value).trim();
+    if (v.length < LICENSE_MIN_HWID || v.length > 200) return null;
+    return crypto.createHash("sha256").update("arc-hwid:" + v).digest("hex");
+}
+function arcHwidFingerprint(hash) { return hash ? hash.slice(0, 10) : null; }
+
+// Same idea as the webhook seal: server-only secret, nothing readable at rest.
+function arcSealSecret() {
+    const secret = process.env.ARC_LICENSE_SECRET || process.env.SHOP_SECRET_KEY || process.env.GH_DATA_TOKEN || "";
+    if (!secret) return null;
+    return crypto.createHash("sha256").update("arc-license-store:" + secret).digest();
+}
+function arcSeal(value) {
+    const key = arcSealSecret();
+    if (!key || !value) return "";
+    try {
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+        const enc = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
+        return ["v1", iv.toString("base64"), cipher.getAuthTag().toString("base64"), enc.toString("base64")].join(":");
+    } catch (_) { return ""; }
+}
+function arcUnseal(sealed) {
+    const key = arcSealSecret();
+    if (!key || !sealed) return "";
+    const parts = String(sealed).split(":");
+    if (parts.length !== 4 || parts[0] !== "v1") return "";
+    try {
+        const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(parts[1], "base64"));
+        decipher.setAuthTag(Buffer.from(parts[2], "base64"));
+        const out = Buffer.concat([decipher.update(Buffer.from(parts[3], "base64")), decipher.final()]);
+        return out.toString("utf8");
+    } catch (_) { return ""; }
+}
+
+function arcPlan(id) {
+    const want = String(id == null ? "" : id).toLowerCase();
+    return ARC_PLANS.find(p => p.id === want) || null;
+}
+function arcPlanLabel(id) { const p = arcPlan(id); return p ? p.label : String(id || ""); }
+function arcPlanPublic(p) {
+    return { id: p.id, label: p.label, usdCents: p.usdCents, usd: (p.usdCents / 100).toFixed(2), days: p.days, blurb: p.blurb, perks: p.perks, best: !!p.best };
+}
+
+function arcLicenseExpired(rec) { return !!(rec && rec.expiresAt && Date.now() > rec.expiresAt); }
+function arcLicenseAlive(rec) { return !!rec && !rec.revoked && !arcLicenseExpired(rec); }
+function arcLicenseStatus(rec) {
+    if (!rec) return "invalid";
+    if (rec.revoked) return "revoked";
+    if (arcLicenseExpired(rec)) return "expired";
+    return rec.hwid ? "active" : "unused";
+}
+function arcLicenseFind(body) {
+    if (!body) return null;
+    const hash = arcKeyHash(body);
+    return Object.values(licenses).find(r => r.hash === hash) || null;
+}
+function arcLicensePlain(rec) {
+    if (!rec) return null;
+    if (rec.keyPlain) return rec.keyPlain;
+    const opened = arcUnseal(rec.keySealed);
+    if (opened) { rec.keyPlain = arcKeyDisplay(opened); return rec.keyPlain; }
+    return "ARC-••••-••••-••••";
+}
+
+// "when the key is invalid it deletes itself" — expiry and revocation remove the
+// record outright, leaving only a line in the archive so the panel can explain.
+function arcLicensePurge(rec, reason) {
+    if (!rec || !licenses[rec.id]) return false;
+    delete licenses[rec.id];
+    licenseArchive.unshift({
+        hint: arcLicensePlain(rec), plan: rec.plan, reason,
+        at: Date.now(), bound: !!rec.hwid, buyer: rec.buyer || null, ref: rec.ref || null
+    });
+    if (licenseArchive.length > LICENSE_ARCHIVE_MAX) licenseArchive.length = LICENSE_ARCHIVE_MAX;
+    console.log("License " + rec.id + " deleted itself (" + reason + ")");
+    persistLicenses();
+    return true;
+}
+function arcLicenseReap() {
+    for (const rec of Object.values(licenses)) {
+        if (rec.revoked) arcLicensePurge(rec, "revoked");
+        else if (arcLicenseExpired(rec)) arcLicensePurge(rec, "expired");
+    }
+}
+
+function arcLicenseCreate(opts) {
+    opts = opts || {};
+    const plan = arcPlan(opts.plan) || ARC_PLANS[0];
+    const days = opts.days == null ? plan.days : Math.max(0, Math.floor(Number(opts.days) || 0));
+    const now = Date.now();
+    let body = null;
+    for (let i = 0; i < 60 && !body; i++) {
+        const candidate = arcKeyRandom();
+        if (!arcLicenseFind(candidate)) body = candidate;
+    }
+    if (!body) body = arcKeyRandom();
+    const hwid = opts.hwid ? arcHwid(opts.hwid) : null;
+    const rec = {
+        id: "key_" + crypto.randomBytes(6).toString("hex"),
+        hash: arcKeyHash(body),
+        keyPlain: arcKeyDisplay(body),
+        keySealed: arcSeal(body),
+        plan: plan.id,
+        days,
+        createdAt: now,
+        expiresAt: days > 0 ? now + days * 86400000 : 0,
+        hwid,
+        hwidAt: hwid ? now : null,
+        activations: 0,
+        lastSeenAt: null,
+        orderId: opts.orderId || null,
+        ref: opts.ref || null,
+        buyer: opts.buyer || null,
+        issuedBy: opts.issuedBy || "admin",
+        note: String(opts.note || "").slice(0, 160),
+        revoked: false
+    };
+    licenses[rec.id] = rec;
+    licenseIssued++;
+    persistLicenses();
+    return rec;
+}
+
+function arcLicenseAdminView(rec) {
+    return {
+        id: rec.id,
+        key: arcLicensePlain(rec),
+        plan: rec.plan,
+        planLabel: arcPlanLabel(rec.plan),
+        days: rec.days,
+        createdAt: rec.createdAt,
+        expiresAt: rec.expiresAt,
+        status: arcLicenseStatus(rec),
+        hwid: rec.hwid ? arcHwidFingerprint(rec.hwid) : null,
+        hwidAt: rec.hwidAt || null,
+        activations: rec.activations || 0,
+        lastSeenAt: rec.lastSeenAt || null,
+        orderId: rec.orderId || null,
+        ref: rec.ref || null,
+        buyer: rec.buyer || null,
+        issuedBy: rec.issuedBy,
+        note: rec.note || null
+    };
+}
+// What a buyer is allowed to see: never the HWID, never another buyer's data.
+function arcLicenseBuyerView(rec) {
+    return {
+        key: arcLicensePlain(rec),
+        plan: rec.plan,
+        planLabel: arcPlanLabel(rec.plan),
+        days: rec.days,
+        expiresAt: rec.expiresAt,
+        bound: !!rec.hwid,
+        status: arcLicenseStatus(rec)
+    };
+}
+function arcLicensesForOrder(order) {
+    return Object.values(licenses).filter(r => r.orderId && order && r.orderId === order.id);
+}
+function arcLicenseStats() {
+    const list = Object.values(licenses);
+    return {
+        total: list.length,
+        active: list.filter(r => r.hwid && arcLicenseAlive(r)).length,
+        unused: list.filter(r => !r.hwid && arcLicenseAlive(r)).length,
+        weekly: list.filter(r => r.plan === "weekly").length,
+        monthly: list.filter(r => r.plan === "monthly").length,
+        lifetime: list.filter(r => r.plan === "lifetime").length,
+        issued: licenseIssued,
+        purged: licenseArchive.length
+    };
+}
+
+// A paid plan order mints exactly one key, no matter how often it gets re-checked.
+function arcEnsureLicenseForOrder(order) {
+    if (!order || order.kind !== "plan") return null;
+    if (!["paid", "delivered"].includes(order.status)) return null;
+    const existing = arcLicensesForOrder(order)[0];
+    if (existing) return existing;
+    const rec = arcLicenseCreate({
+        plan: order.planId,
+        orderId: order.id,
+        ref: order.ref,
+        buyer: order.discord || order.robloxUsername || null,
+        issuedBy: "shop",
+        note: "plan order " + order.ref
+    });
+    order.licenseId = rec.id;
+    persistShop();
+    console.log("License issued for plan order " + order.ref + " (" + rec.plan + ")");
+    return rec;
+}
+
+// Shared gate for /license/activate and /license/verify.
+function arcLicenseCheck(rawKey, rawHwid) {
+    const body = arcKeyNormalize(rawKey);
+    if (!body) return { fail: { ok: false, code: "invalid", error: "That key does not look right — check it and try again." } };
+    const rec = arcLicenseFind(body);
+    if (!rec) return { fail: { ok: false, code: "invalid", error: "This key does not exist." } };
+    if (rec.revoked) { arcLicensePurge(rec, "revoked"); return { fail: { ok: false, code: "revoked", error: "This key was revoked and is no longer valid." } }; }
+    if (arcLicenseExpired(rec)) { arcLicensePurge(rec, "expired"); return { fail: { ok: false, code: "expired", error: "This key has expired." } }; }
+    const hwid = arcHwid(rawHwid);
+    if (!hwid) return { fail: { ok: false, code: "hwid", error: "Arc could not read this PC's hardware id." } };
+    if (rec.hwid && rec.hwid !== hwid) return { fail: { ok: false, code: "bound", error: "This key is already bound to another PC." } };
+    return { rec, hwid, body };
+}
+
+// ── license persistence (local file + sanitised GitHub mirror) ─────────────
+
+let licensePersistTimer = null;
+function persistLicenses() {
+    try { fs.writeFileSync("./licenses-data.json", JSON.stringify({ licenses, archive: licenseArchive, issued: licenseIssued })); } catch (_) {}
+    if (licensePersistTimer) return;
+    const mirror = {};
+    for (const [id, rec] of Object.entries(licenses)) {
+        const copy = Object.assign({}, rec);
+        delete copy.keyPlain; // the plaintext key never leaves the container
+        mirror[id] = copy;
+    }
+    const snapshot = JSON.stringify({ licenses: mirror, archive: licenseArchive, issued: licenseIssued });
+    licensePersistTimer = setTimeout(async () => {
+        licensePersistTimer = null;
+        try {
+            const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${LICENSE_DATA_PATH}`);
+            const payload = { content: Buffer.from(snapshot, "utf8").toString("base64"), message: "license update", branch: "main" };
+            if (res.status === 200) payload.sha = JSON.parse(res.body).sha;
+            const put = await ghApi("PUT", `/repos/${GH_DATA_REPO}/contents/${LICENSE_DATA_PATH}`, payload);
+            if (put.status !== 200 && put.status !== 201) console.log("License save skipped (" + put.status + ")");
+        } catch (e) { console.log("License save failed: " + e.message); }
+    }, 2500);
+}
+
+async function loadLicensesFromGitHub() {
+    try {
+        const res = await ghApi("GET", `/repos/${GH_DATA_REPO}/contents/${LICENSE_DATA_PATH}`);
+        if (res.status === 200) {
+            const saved = JSON.parse(Buffer.from(JSON.parse(res.body).content, "base64").toString("utf8"));
+            if (saved.licenses) Object.assign(licenses, saved.licenses);
+            if (Array.isArray(saved.archive)) licenseArchive.push(...saved.archive.slice(0, LICENSE_ARCHIVE_MAX));
+            if (Number(saved.issued) > 0) licenseIssued = Number(saved.issued);
+        }
+    } catch (e) { console.log("License load skipped: " + e.message); }
+    try {
+        if (!Object.keys(licenses).length && fs.existsSync("./licenses-data.json")) {
+            const saved = JSON.parse(fs.readFileSync("./licenses-data.json", "utf8"));
+            if (saved.licenses) Object.assign(licenses, saved.licenses);
+            if (Array.isArray(saved.archive)) licenseArchive.push(...saved.archive.slice(0, LICENSE_ARCHIVE_MAX));
+            if (Number(saved.issued) > 0) licenseIssued = Number(saved.issued);
+        }
+    } catch (_) {}
+    if (!licenseIssued) licenseIssued = Object.keys(licenses).length;
+    console.log("Arc licenses loaded: " + Object.keys(licenses).length + " keys");
+}
+
 // Boot the shop AFTER every constant above exists — loadShopFromGitHub() reads
 // SHOP_DATA_PATH, so calling this earlier throws a TDZ error and silently loses
 // all orders on redeploy.
 shopStart();
+loadLicensesFromGitHub().catch(() => {});
+// Keys delete themselves on expiry/revocation; the sweep makes sure a key that
+// runs out while nobody is looking still vanishes.
+setInterval(() => { try { arcLicenseReap(); } catch (_) {} }, 60000);
 
 // Restore auto-discovered games + real launch counters so the catalog survives a redeploy.
 loadGamesFromGitHub().catch(() => {});
@@ -1675,6 +2011,8 @@ const server = http.createServer((req, res) => {
             maxRobux: SHOP_MAX_ROBUX,
             packs: st.packs,
             tiers: SHOP_TIERS,
+            plans: ARC_PLANS.map(arcPlanPublic),
+            license: arcLicenseStats(),
             rates,
             coins: Object.keys(SHOP_COINS).map(key => ({
                 key,
@@ -1715,23 +2053,34 @@ const server = http.createServer((req, res) => {
                 const address = shopConfig.addresses[coinKey];
                 if (!address) return sendJson(400, { error: SHOP_COINS[coinKey].name + " is not available right now" });
 
-                const robloxUsername = String(body.robloxUsername || "").trim().slice(0, 20);
-                if (!/^[A-Za-z0-9_]{3,20}$/.test(robloxUsername)) return sendJson(400, { error: "Enter the Roblox username that should receive the Robux" });
+                const kind = String(body.kind || "").toLowerCase() === "plan" ? "plan" : "robux";
                 const discord = String(body.discord || "").trim().slice(0, 64);
+                const robloxUsername = String(body.robloxUsername || "").trim().slice(0, 20);
 
-                let robux, usdCents, packId = null;
-                if (body.pack) {
-                    const pack = shopPackStatus().packs.find(p => p.id === String(body.pack));
-                    if (!pack) return sendJson(400, { error: "Unknown pack" });
-                    if (pack.remaining <= 0) return sendJson(409, { error: pack.label + " is sold out" });
-                    robux = pack.robux;
-                    usdCents = pack.usdCents;
-                    packId = pack.id;
+                let robux, usdCents, packId = null, planId = null;
+                if (kind === "plan") {
+                    // A plan needs no Roblox account — only the plan itself. The key
+                    // is minted the moment the payment is confirmed.
+                    const plan = arcPlan(body.plan);
+                    if (!plan) return sendJson(400, { error: "Unknown plan" });
+                    planId = plan.id;
+                    robux = 0;
+                    usdCents = plan.usdCents;
                 } else {
-                    robux = Math.floor(Number(body.robux) || 0);
-                    if (robux < SHOP_MIN_ROBUX) return sendJson(400, { error: `Minimum order is ${SHOP_MIN_ROBUX.toLocaleString("en-US")} Robux` });
-                    if (robux > SHOP_MAX_ROBUX) return sendJson(400, { error: "Order too large — contact us on Discord" });
-                    usdCents = shopQuoteCustom(robux).usdCents;
+                    if (!/^[A-Za-z0-9_]{3,20}$/.test(robloxUsername)) return sendJson(400, { error: "Enter the Roblox username that should receive the Robux" });
+                    if (body.pack) {
+                        const pack = shopPackStatus().packs.find(p => p.id === String(body.pack));
+                        if (!pack) return sendJson(400, { error: "Unknown pack" });
+                        if (pack.remaining <= 0) return sendJson(409, { error: pack.label + " is sold out" });
+                        robux = pack.robux;
+                        usdCents = pack.usdCents;
+                        packId = pack.id;
+                    } else {
+                        robux = Math.floor(Number(body.robux) || 0);
+                        if (robux < SHOP_MIN_ROBUX) return sendJson(400, { error: `Minimum order is ${SHOP_MIN_ROBUX.toLocaleString("en-US")} Robux` });
+                        if (robux > SHOP_MAX_ROBUX) return sendJson(400, { error: "Order too large — contact us on Discord" });
+                        usdCents = shopQuoteCustom(robux).usdCents;
+                    }
                 }
 
                 await shopRefreshRates(false);
@@ -1746,6 +2095,7 @@ const server = http.createServer((req, res) => {
                 const order = {
                     id,
                     ref: shopOrderRef(),
+                    kind,
                     coin: coinKey,
                     address,
                     tag,
@@ -1754,6 +2104,7 @@ const server = http.createServer((req, res) => {
                     usdCents,
                     robux,
                     packId,
+                    planId,
                     robloxUsername,
                     discord,
                     status: "awaiting_payment",
@@ -1858,6 +2209,8 @@ const server = http.createServer((req, res) => {
             if (body.txid) order.txid = String(body.txid).slice(0, 120);
             order.status = status;
             order.updatedAt = Date.now();
+            // Marking a plan order paid by hand still mints the key.
+            try { arcEnsureLicenseForOrder(order); } catch (_) {}
             persistShop();
             sendJson(200, { ok: true, order: shopPublicOrder(order) });
         });
@@ -1895,6 +2248,178 @@ const server = http.createServer((req, res) => {
             persistShop();
             sendJson(200, { ok: true, config: shopAdminConfig(), errors });
         });
+    }
+
+    /* ══ Arc License — storefront + executor ═════════════════════════════════ */
+
+    // GET /shop/plans — the plan catalog (there is deliberately no free plan)
+    if (req.method === "GET" && pathname === "/shop/plans") {
+        return sendJson(200, {
+            ok: true,
+            enabled: !!shopConfig.enabled,
+            free: false,
+            plans: ARC_PLANS.map(arcPlanPublic),
+            coins: Object.keys(SHOP_COINS)
+                .filter(key => !!shopConfig.addresses[key])
+                .map(key => ({ key, name: SHOP_COINS[key].name, symbol: SHOP_COINS[key].symbol })),
+            license: arcLicenseStats()
+        });
+    }
+
+    // POST /license/activate — first launch on a PC: the key binds to that HWID.
+    // Always answers 200 with { ok } so the executor can show the exact reason.
+    if (req.method === "POST" && pathname === "/license/activate") {
+        return readJson(body => {
+            const ip = shopIp(req);
+            const now = Date.now();
+            licenseIpLog[ip] = (licenseIpLog[ip] || []).filter(t => now - t < 10 * 60 * 1000);
+            if (licenseIpLog[ip].length >= 40) return sendJson(429, { ok: false, code: "rate", error: "Too many key attempts from this connection — wait a minute and try again." });
+            licenseIpLog[ip].push(now);
+
+            const check = arcLicenseCheck(body.key, body.hwid);
+            if (check.fail) return sendJson(200, check.fail);
+
+            const rec = check.rec;
+            const first = !rec.hwid;
+            if (first) { rec.hwid = check.hwid; rec.hwidAt = now; }
+            rec.activations = (rec.activations || 0) + 1;
+            rec.lastSeenAt = now;
+            persistLicenses();
+            sendJson(200, {
+                ok: true,
+                key: arcKeyDisplay(check.body),
+                plan: rec.plan,
+                planLabel: arcPlanLabel(rec.plan),
+                days: rec.days,
+                expiresAt: rec.expiresAt,
+                bound: true,
+                firstActivation: first,
+                serverTime: now
+            });
+        });
+    }
+
+    // POST /license/verify — heartbeat while Arc runs. An expired or revoked key is
+    // gone from the store by now, so this is what makes a running copy of Arc notice
+    // and delete its local key.
+    if (req.method === "POST" && pathname === "/license/verify") {
+        return readJson(body => {
+            const check = arcLicenseCheck(body.key, body.hwid);
+            if (check.fail) return sendJson(200, check.fail);
+            const rec = check.rec;
+            rec.lastSeenAt = Date.now();
+            persistLicenses();
+            sendJson(200, {
+                ok: true,
+                key: arcKeyDisplay(check.body),
+                plan: rec.plan,
+                planLabel: arcPlanLabel(rec.plan),
+                days: rec.days,
+                expiresAt: rec.expiresAt,
+                bound: !!rec.hwid,
+                serverTime: Date.now()
+            });
+        });
+    }
+
+    /* ══ Arc License — admin ═════════════════════════════════════════════════ */
+
+    // GET /admin/api/keys — every key, plus the keys that deleted themselves
+    if (req.method === "GET" && pathname === "/admin/api/keys") {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const keys = Object.values(licenses)
+            .sort((a, b) => b.createdAt - a.createdAt)
+            .map(arcLicenseAdminView);
+        return sendJson(200, {
+            ok: true,
+            keys,
+            archive: licenseArchive,
+            plans: ARC_PLANS.map(arcPlanPublic),
+            stats: arcLicenseStats(),
+            enablement: { sealed: !!arcSealSecret() }
+        });
+    }
+
+    // POST /admin/api/keys — generate keys by hand
+    if (req.method === "POST" && pathname === "/admin/api/keys") {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        return readJson(body => {
+            const plan = arcPlan(body.plan);
+            if (!plan) return sendJson(400, { error: "Unknown plan" });
+            const count = Math.min(50, Math.max(1, Math.floor(Number(body.count) || 1)));
+            const customDays = body.days == null || body.days === "" ? null : Math.max(0, Math.floor(Number(body.days) || 0));
+            const hwid = body.hwid ? String(body.hwid).trim() : null;
+            if (hwid && !arcHwid(hwid)) return sendJson(400, { error: "That hardware id is too short to bind to" });
+            const note = String(body.note || "").slice(0, 160);
+            const buyer = body.buyer ? String(body.buyer).slice(0, 64) : null;
+            const created = [];
+            for (let i = 0; i < count; i++) {
+                created.push(arcLicenseAdminView(arcLicenseCreate({
+                    plan: plan.id,
+                    days: customDays == null ? plan.days : customDays,
+                    hwid,
+                    note,
+                    buyer,
+                    issuedBy: "admin"
+                })));
+            }
+            sendJson(200, { ok: true, keys: created, stats: arcLicenseStats() });
+        });
+    }
+
+    // PATCH /admin/api/keys/:id — unbind, extend, switch plan, or revoke (= delete)
+    if (req.method === "PATCH" && pathname.startsWith("/admin/api/keys/")) {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const id = decodeURIComponent(pathname.replace("/admin/api/keys/", ""));
+        const rec = licenses[id];
+        if (!rec) return sendJson(404, { error: "Key not found" });
+        return readJson(body => {
+            if (body.revoked) {
+                rec.revoked = true;
+                arcLicensePurge(rec, "revoked");
+                return sendJson(200, { ok: true, deleted: id, reason: "revoked" });
+            }
+            if (body.unbindHwid) { rec.hwid = null; rec.hwidAt = null; }
+            if (body.plan != null) {
+                const plan = arcPlan(body.plan);
+                if (!plan) return sendJson(400, { error: "Unknown plan" });
+                rec.plan = plan.id;
+                rec.days = plan.days;
+                rec.expiresAt = plan.days > 0 ? Date.now() + plan.days * 86400000 : 0;
+            }
+            if (body.days != null && body.days !== "") {
+                const days = Math.max(0, Math.floor(Number(body.days) || 0));
+                rec.days = days;
+                rec.expiresAt = days > 0 ? Date.now() + days * 86400000 : 0;
+            }
+            if (body.extendDays != null && body.extendDays !== "") {
+                const add = Math.max(0, Math.floor(Number(body.extendDays) || 0));
+                if (add > 0) {
+                    const from = rec.expiresAt > Date.now() ? rec.expiresAt : Date.now();
+                    rec.expiresAt = from + add * 86400000;
+                    rec.days = rec.days + add;
+                }
+            }
+            if (body.expiresAt != null && body.expiresAt !== "") {
+                const at = Math.floor(Number(body.expiresAt) || 0);
+                rec.expiresAt = at > 0 ? at : 0; // 0 = never expires
+                if (rec.expiresAt) rec.days = Math.max(0, Math.round((rec.expiresAt - rec.createdAt) / 86400000));
+            }
+            if (body.note != null) rec.note = String(body.note).slice(0, 160);
+            if (body.buyer != null) rec.buyer = String(body.buyer).slice(0, 64) || null;
+            persistLicenses();
+            sendJson(200, { ok: true, key: arcLicenseAdminView(rec) });
+        });
+    }
+
+    // DELETE /admin/api/keys/:id — delete a key that was never sold (typo, test, refund)
+    if (req.method === "DELETE" && pathname.startsWith("/admin/api/keys/")) {
+        if (!isAdminAuthorized()) return sendJson(401, { error: "Authentication required" });
+        const id = decodeURIComponent(pathname.replace("/admin/api/keys/", ""));
+        const rec = licenses[id];
+        if (!rec) return sendJson(404, { error: "Key not found" });
+        arcLicensePurge(rec, "deleted by admin");
+        return sendJson(200, { ok: true, deleted: id, reason: "deleted" });
     }
 
     res.writeHead(404, { "Content-Type": "text/plain" });
