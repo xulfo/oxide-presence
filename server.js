@@ -148,7 +148,8 @@ const GAME_NAMES = {
     100068273119174: "Leaf Simulator",
     108628039999641: "Search For The Needle",
     77108422251420: "Search For The Needle",
-    17625359962: "RIVALS"
+    17625359962: "RIVALS",
+    124216119978534: "Ride A Pet"
 };
 
 const BASELINE_GAMES = [
@@ -163,6 +164,7 @@ const BASELINE_GAMES = [
     { name: "Leaf Simulator", launches: 11500, place_id: 100068273119174 },
     { name: "Search For The Needle", launches: 1500, place_id: 108628039999641 },
     { name: "RIVALS", launches: 2500, place_id: 17625359962 },
+    { name: "Ride A Pet", launches: 0, place_id: 124216119978534 },
     { name: "Universal", launches: 3200, place_id: 0 }
 ];
 
@@ -183,7 +185,8 @@ const UNIVERSE_IDS = {
     128736949265057: 9199655655,
     100068273119174: 10539411000,
     108628039999641: 10756011174,
-    17625359962: 6035872082
+    17625359962: 6035872082,
+    124216119978534: 10035204815
 };
 
 // Which game a client is in is decided by place id alone, against a fixed set of games
